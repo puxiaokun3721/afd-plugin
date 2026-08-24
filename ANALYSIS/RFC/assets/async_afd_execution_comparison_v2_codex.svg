@@ -1,0 +1,330 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1900" height="1330" viewBox="0 0 1900 1330" role="img" aria-labelledby="title desc">
+  <title id="title">Colocated MoE, synchronous AFD, and asynchronous AFD timing comparison</title>
+  <desc id="desc">Three timing panels on a shared time scale. The first shows two colocated MoE layers with global synchronization bubbles. The second shows synchronous AFD with two stages and waiting after both Attention stages have been sent. The third shows asynchronous AFD consuming complete DP-stage work items after their sends finish.</desc>
+  <defs>
+    <style>
+      .panel { fill: #ffffff; stroke: #7da4c7; stroke-width: 1.5; }
+      .panel-no { fill: #07558d; }
+      .panel-no-text { fill: #ffffff; font: 700 25px Arial, sans-serif; text-anchor: middle; dominant-baseline: middle; }
+      .title { fill: #171717; font: 700 28px Arial, sans-serif; }
+      .subtitle { fill: #333333; font: italic 17px Arial, sans-serif; }
+      .row-label { fill: #171717; font: 700 17px Arial, sans-serif; text-anchor: end; dominant-baseline: middle; }
+      .bar-text { fill: #161616; font: 600 13px Arial, sans-serif; text-anchor: middle; dominant-baseline: middle; }
+      .small-text { fill: #252525; font: 12px Arial, sans-serif; text-anchor: middle; }
+      .note { fill: #333333; font: italic 14px Arial, sans-serif; }
+      .axis { stroke: #222222; stroke-width: 1.5; }
+      .grid { stroke: #dce4eb; stroke-width: 1; stroke-dasharray: 3 5; }
+      .attn { fill: #f8bfd3; stroke: #ed4b87; stroke-width: 1.4; }
+      .a2f { fill: #c6e3fb; stroke: #3395dc; stroke-width: 1.4; }
+      .ffn { fill: #cce9c7; stroke: #4d9c46; stroke-width: 1.4; }
+      .f2a { fill: #ffe1b9; stroke: #f3922b; stroke-width: 1.4; }
+      .idle { fill: #fffafa; stroke: #e53935; stroke-width: 1.8; stroke-dasharray: 7 5; }
+      .recv-wait { fill: #edf6fd; stroke: #3395dc; stroke-width: 1.5; stroke-dasharray: 6 4; }
+      .warmup { fill: #eeeeee; stroke: #9e9e9e; stroke-width: 1.2; }
+      .rendezvous { stroke: #222222; stroke-width: 2; stroke-dasharray: 7 5; }
+      .section-line { stroke: #6d7b86; stroke-width: 1; }
+      .milestone { fill: #222222; font: 600 13px Arial, sans-serif; text-anchor: middle; }
+      .legend { fill: #202020; font: 16px Arial, sans-serif; dominant-baseline: middle; }
+      .takeaway { fill: #151515; font: 700 23px Arial, sans-serif; text-anchor: middle; }
+    </style>
+    <marker id="arrow" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+      <polygon points="0 0, 9 3.5, 0 7" fill="#222222"/>
+    </marker>
+  </defs>
+
+  <rect width="1900" height="1330" fill="#f8fafc"/>
+
+  <!-- Shared time grid: x = 170 + 8 * t, t in [0, 200]. -->
+  <g aria-label="shared time grid">
+    <line class="grid" x1="170" y1="88" x2="170" y2="1150"/>
+    <line class="grid" x1="330" y1="88" x2="330" y2="1150"/>
+    <line class="grid" x1="490" y1="88" x2="490" y2="1150"/>
+    <line class="grid" x1="650" y1="88" x2="650" y2="1150"/>
+    <line class="grid" x1="810" y1="88" x2="810" y2="1150"/>
+    <line class="grid" x1="970" y1="88" x2="970" y2="1150"/>
+    <line class="grid" x1="1130" y1="88" x2="1130" y2="1150"/>
+    <line class="grid" x1="1290" y1="88" x2="1290" y2="1150"/>
+    <line class="grid" x1="1450" y1="88" x2="1450" y2="1150"/>
+    <line class="grid" x1="1610" y1="88" x2="1610" y2="1150"/>
+    <line class="grid" x1="1770" y1="88" x2="1770" y2="1150"/>
+  </g>
+
+  <text x="1770" y="25" class="milestone" text-anchor="end">Shared illustrative time scale →</text>
+
+  <!-- Panel 01 -->
+  <rect class="panel" x="15" y="35" width="1870" height="330" rx="13"/>
+  <rect class="panel-no" x="35" y="52" width="56" height="43" rx="9"/>
+  <text class="panel-no-text" x="63" y="74">01</text>
+  <text class="title" x="110" y="69">Colocated MoE</text>
+  <text class="subtitle" x="110" y="94">Attention imbalance becomes a global MoE synchronization bubble.</text>
+
+  <text class="milestone" x="410" y="116">Layer 1</text>
+  <line class="section-line" x1="170" y1="123" x2="938" y2="123"/>
+  <text class="milestone" x="1178" y="116">Layer 2</text>
+  <line class="section-line" x1="938" y1="123" x2="1706" y2="123"/>
+
+  <text class="row-label" x="145" y="157">DP0</text>
+  <text class="row-label" x="145" y="207">DP1</text>
+  <text class="row-label" x="145" y="257">DP2</text>
+
+  <!-- L1 Attention: 20, 35, 60 time units. -->
+  <rect class="attn" x="170" y="139" width="160" height="36"/>
+  <text class="bar-text" x="250" y="157">B0 L1 Attn</text>
+  <rect class="idle" x="330" y="139" width="320" height="36"/>
+
+  <rect class="attn" x="170" y="189" width="280" height="36"/>
+  <text class="bar-text" x="310" y="207">B1 L1 Attn</text>
+  <rect class="idle" x="450" y="189" width="200" height="36"/>
+
+  <rect class="attn" x="170" y="239" width="480" height="36"/>
+  <text class="bar-text" x="410" y="257">B2 L1 Attn</text>
+
+  <line class="rendezvous" x1="650" y1="115" x2="650" y2="285"/>
+  <text class="milestone" x="650" y="106">Global rendezvous</text>
+  <rect class="a2f" x="650" y="139" width="48" height="136"/>
+  <text class="bar-text" x="674" y="207" transform="rotate(-90 674 207)">L1 Dispatch</text>
+  <rect class="ffn" x="698" y="139" width="192" height="136"/>
+  <text class="bar-text" x="794" y="207">L1 FFN</text>
+  <rect class="f2a" x="890" y="139" width="48" height="136"/>
+  <text class="bar-text" x="914" y="207" transform="rotate(-90 914 207)">L1 Combine</text>
+
+  <!-- L2 begins at t=96 and repeats the same Attention work exactly. -->
+  <rect class="attn" x="938" y="139" width="160" height="36"/>
+  <text class="bar-text" x="1018" y="157">B0 L2 Attn</text>
+  <rect class="idle" x="1098" y="139" width="320" height="36"/>
+
+  <rect class="attn" x="938" y="189" width="280" height="36"/>
+  <text class="bar-text" x="1078" y="207">B1 L2 Attn</text>
+  <rect class="idle" x="1218" y="189" width="200" height="36"/>
+
+  <rect class="attn" x="938" y="239" width="480" height="36"/>
+  <text class="bar-text" x="1178" y="257">B2 L2 Attn</text>
+
+  <line class="rendezvous" x1="1418" y1="115" x2="1418" y2="285"/>
+  <text class="milestone" x="1418" y="106">Global rendezvous</text>
+  <rect class="a2f" x="1418" y="139" width="48" height="136"/>
+  <text class="bar-text" x="1442" y="207" transform="rotate(-90 1442 207)">L2 Dispatch</text>
+  <rect class="ffn" x="1466" y="139" width="192" height="136"/>
+  <text class="bar-text" x="1562" y="207">L2 FFN</text>
+  <rect class="f2a" x="1658" y="139" width="48" height="136"/>
+  <text class="bar-text" x="1682" y="207" transform="rotate(-90 1682 207)">L2 Combine</text>
+  <text class="note" x="170" y="320">No microbatching: every layer waits for the slowest Attention DP before MoE can advance.</text>
+  <text class="note" x="170" y="342">The dual-stage panels below split—not shorten—the same Attention work: full batch = S0 + S1.</text>
+
+  <!-- Panel 02 -->
+  <rect class="panel" x="15" y="385" width="1870" height="385" rx="13"/>
+  <rect class="panel-no" x="35" y="402" width="56" height="43" rx="9"/>
+  <text class="panel-no-text" x="63" y="424">02</text>
+  <text class="title" x="110" y="419">Synchronous AFD with Dual-Stage Execution</text>
+  <text class="subtitle" x="110" y="444">Dual-stage execution overlaps remote FFN work, but FFN receive still waits for every DP in each stage.</text>
+
+  <text class="row-label" x="145" y="493">Attn DP0</text>
+  <text class="row-label" x="145" y="543">Attn DP1</text>
+  <text class="row-label" x="145" y="593">Attn DP2</text>
+  <text class="row-label" x="145" y="676">FFN pool</text>
+  <line class="section-line" x1="165" y1="626" x2="1810" y2="626"/>
+
+  <!-- DP0: 10 + 10 Attention units = 20, matching Panel 01 B0. -->
+  <rect class="attn" x="170" y="475" width="80" height="36"/>
+  <text class="bar-text" x="210" y="493">B0-S0 Attn</text>
+  <rect class="a2f" x="250" y="475" width="48" height="36"/>
+  <text class="bar-text" x="274" y="487"><tspan x="274" dy="0">S0 A2F</tspan><tspan x="274" dy="13">send</tspan></text>
+  <rect class="attn" x="298" y="475" width="80" height="36"/>
+  <text class="bar-text" x="338" y="493">B0-S1 Attn</text>
+  <rect class="a2f" x="378" y="475" width="48" height="36"/>
+  <text class="bar-text" x="402" y="487"><tspan x="402" dy="0">S1 A2F</tspan><tspan x="402" dy="13">send</tspan></text>
+  <rect class="idle" x="426" y="475" width="224" height="36"/>
+  <text class="bar-text" x="538" y="493">Wait for S0 F2A</text>
+  <rect class="f2a" x="650" y="475" width="48" height="36"/>
+  <text class="bar-text" x="674" y="487"><tspan x="674" dy="0">S0 F2A</tspan><tspan x="674" dy="13">recv</tspan></text>
+  <rect class="attn" x="698" y="475" width="80" height="36"/>
+  <text class="bar-text" x="738" y="493">B0-S0 L2 Attn</text>
+
+  <!-- DP1: 18 + 17 Attention units = 35, matching Panel 01 B1. -->
+  <rect class="attn" x="170" y="525" width="144" height="36"/>
+  <text class="bar-text" x="242" y="543">B1-S0 Attn</text>
+  <rect class="a2f" x="314" y="525" width="48" height="36"/>
+  <text class="bar-text" x="338" y="537"><tspan x="338" dy="0">S0 A2F</tspan><tspan x="338" dy="13">send</tspan></text>
+  <rect class="attn" x="362" y="525" width="136" height="36"/>
+  <text class="bar-text" x="430" y="543">B1-S1 Attn</text>
+  <rect class="a2f" x="498" y="525" width="48" height="36"/>
+  <text class="bar-text" x="522" y="537"><tspan x="522" dy="0">S1 A2F</tspan><tspan x="522" dy="13">send</tspan></text>
+  <rect class="idle" x="546" y="525" width="104" height="36"/>
+  <text class="bar-text" x="598" y="543">Wait S0 F2A</text>
+  <rect class="f2a" x="650" y="525" width="48" height="36"/>
+  <text class="bar-text" x="674" y="537"><tspan x="674" dy="0">S0 F2A</tspan><tspan x="674" dy="13">recv</tspan></text>
+  <rect class="attn" x="698" y="525" width="144" height="36"/>
+  <text class="bar-text" x="770" y="543">B1-S0 L2 Attn</text>
+
+  <!-- DP2: 30 + 30 Attention units = 60, matching Panel 01 B2. -->
+  <rect class="attn" x="170" y="575" width="240" height="36"/>
+  <text class="bar-text" x="290" y="593">B2-S0 Attn</text>
+  <rect class="a2f" x="410" y="575" width="48" height="36"/>
+  <text class="bar-text" x="434" y="587"><tspan x="434" dy="0">S0 A2F</tspan><tspan x="434" dy="13">send</tspan></text>
+  <rect class="attn" x="458" y="575" width="240" height="36"/>
+  <text class="bar-text" x="578" y="593">B2-S1 Attn</text>
+  <rect class="a2f" x="698" y="575" width="48" height="36"/>
+  <text class="bar-text" x="722" y="587"><tspan x="722" dy="0">S1 A2F</tspan><tspan x="722" dy="13">send</tspan></text>
+  <rect class="f2a" x="746" y="575" width="32" height="36"/>
+  <text class="bar-text" x="762" y="587"><tspan x="762" dy="0">S0</tspan><tspan x="762" dy="13">recv</tspan></text>
+  <rect class="attn" x="778" y="575" width="240" height="36"/>
+  <text class="bar-text" x="898" y="593">B2-S0 L2 Attn</text>
+
+  <!-- FFN synchronization is inside receive, after individual sends. -->
+  <rect class="recv-wait" x="298" y="650" width="160" height="52"/>
+  <text class="bar-text" x="378" y="670"><tspan x="378" dy="0">S0 A2F recv</tspan><tspan x="378" dy="15">wait for all DPs</tspan></text>
+  <line class="rendezvous" x1="458" y1="636" x2="458" y2="714"/>
+  <text class="milestone" x="458" y="727"><tspan x="458">All S0 inputs</tspan><tspan x="458" dy="14">arrived</tspan></text>
+  <rect class="ffn" x="458" y="650" width="192" height="52"/>
+  <text class="bar-text" x="554" y="676">S0 FFN wave</text>
+  <rect class="f2a" x="650" y="650" width="48" height="52"/>
+  <text class="bar-text" x="674" y="670"><tspan x="674" dy="0">S0 F2A</tspan><tspan x="674" dy="15">send</tspan></text>
+  <rect class="recv-wait" x="698" y="650" width="48" height="52"/>
+  <text class="bar-text" x="722" y="670"><tspan x="722" dy="0">S1 A2F</tspan><tspan x="722" dy="15">recv</tspan></text>
+  <rect class="ffn" x="746" y="650" width="192" height="52"/>
+  <text class="bar-text" x="842" y="676">S1 FFN wave</text>
+  <rect class="f2a" x="938" y="650" width="48" height="52"/>
+  <text class="bar-text" x="962" y="670"><tspan x="962" dy="0">S1 F2A</tspan><tspan x="962" dy="15">send</tspan></text>
+  <text class="note" x="1050" y="680">The first exposed Attention idle appears only after both stage sends.</text>
+  <text class="note" x="170" y="750">Each DP sends independently; FFN compute starts only after its synchronous receive has collected every DP contribution.</text>
+
+  <!-- Panel 03 -->
+  <rect class="panel" x="15" y="790" width="1870" height="390" rx="13"/>
+  <rect class="panel-no" x="35" y="807" width="56" height="43" rx="9"/>
+  <text class="panel-no-text" x="63" y="829">03</text>
+  <text class="title" x="110" y="824">Asynchronous AFD with Dual-Stage Execution</text>
+  <text class="subtitle" x="110" y="849">Each complete DP-stage work item is consumed independently in readiness order.</text>
+
+  <text class="row-label" x="145" y="898">Attn DP0</text>
+  <text class="row-label" x="145" y="948">Attn DP1</text>
+  <text class="row-label" x="145" y="998">Attn DP2</text>
+  <text class="small-text" text-anchor="end" x="150" y="1085">FFN ready queue</text>
+  <line class="section-line" x1="165" y1="1032" x2="1810" y2="1032"/>
+
+  <!-- Same DP0 stage coordinates as Panel 02. -->
+  <rect class="attn" x="170" y="880" width="80" height="36"/>
+  <text class="bar-text" x="210" y="898">B0-S0 Attn</text>
+  <rect class="a2f" x="250" y="880" width="48" height="36"/>
+  <text class="bar-text" x="274" y="892"><tspan x="274" dy="0">S0 A2F</tspan><tspan x="274" dy="13">send</tspan></text>
+  <rect class="attn" x="298" y="880" width="80" height="36"/>
+  <text class="bar-text" x="338" y="898">B0-S1 Attn</text>
+  <rect class="a2f" x="378" y="880" width="48" height="36"/>
+  <text class="bar-text" x="402" y="892"><tspan x="402" dy="0">S1 A2F</tspan><tspan x="402" dy="13">send</tspan></text>
+  <rect class="f2a" x="426" y="880" width="32" height="36"/>
+  <text class="bar-text" x="442" y="892"><tspan x="442" dy="0">S0</tspan><tspan x="442" dy="13">recv</tspan></text>
+  <rect class="attn" x="458" y="880" width="80" height="36"/>
+  <text class="bar-text" x="498" y="898">B0-S0 L2 Attn</text>
+
+  <!-- Same DP1 stage coordinates as Panel 02. -->
+  <rect class="attn" x="170" y="930" width="144" height="36"/>
+  <text class="bar-text" x="242" y="948">B1-S0 Attn</text>
+  <rect class="a2f" x="314" y="930" width="48" height="36"/>
+  <text class="bar-text" x="338" y="942"><tspan x="338" dy="0">S0 A2F</tspan><tspan x="338" dy="13">send</tspan></text>
+  <rect class="attn" x="362" y="930" width="136" height="36"/>
+  <text class="bar-text" x="430" y="948">B1-S1 Attn</text>
+  <rect class="a2f" x="498" y="930" width="48" height="36"/>
+  <text class="bar-text" x="522" y="942"><tspan x="522" dy="0">S1 A2F</tspan><tspan x="522" dy="13">send</tspan></text>
+  <rect class="f2a" x="546" y="930" width="32" height="36"/>
+  <text class="bar-text" x="562" y="942"><tspan x="562" dy="0">S0</tspan><tspan x="562" dy="13">recv</tspan></text>
+  <rect class="attn" x="578" y="930" width="144" height="36"/>
+  <text class="bar-text" x="650" y="948">B1-S0 L2 Attn</text>
+
+  <!-- Same DP2 stage coordinates as Panel 02; only a tiny real queue wait remains. -->
+  <rect class="attn" x="170" y="980" width="240" height="36"/>
+  <text class="bar-text" x="290" y="998">B2-S0 Attn</text>
+  <rect class="a2f" x="410" y="980" width="48" height="36"/>
+  <text class="bar-text" x="434" y="992"><tspan x="434" dy="0">S0 A2F</tspan><tspan x="434" dy="13">send</tspan></text>
+  <rect class="attn" x="458" y="980" width="240" height="36"/>
+  <text class="bar-text" x="578" y="998">B2-S1 Attn</text>
+  <rect class="a2f" x="698" y="980" width="48" height="36"/>
+  <text class="bar-text" x="722" y="992"><tspan x="722" dy="0">S1 A2F</tspan><tspan x="722" dy="13">send</tspan></text>
+  <rect class="idle" x="746" y="980" width="8" height="36"/>
+  <rect class="f2a" x="754" y="980" width="32" height="36"/>
+  <text class="bar-text" x="770" y="992"><tspan x="770" dy="0">S0</tspan><tspan x="770" dy="13">recv</tspan></text>
+  <rect class="attn" x="786" y="980" width="240" height="36"/>
+  <text class="bar-text" x="906" y="998">B2-S0 L2 Attn</text>
+
+  <!-- Queue: every recv starts strictly after its matching A2F send ends. -->
+  <text class="note" x="1050" y="1058">Readiness order, not batch-ID order</text>
+  <rect class="warmup" x="170" y="1067" width="128" height="48"/>
+  <text class="bar-text" x="234" y="1084"><tspan x="234" dy="0">Pipeline</tspan><tspan x="234" dy="15">warm-up</tspan></text>
+
+  <!-- B0-S0: send ends t=16; recv starts t=17. -->
+  <text class="small-text" x="342" y="1058">B0-S0</text>
+  <rect class="a2f" x="306" y="1067" width="24" height="48"/>
+  <text class="bar-text" x="318" y="1091">recv</text>
+  <rect class="ffn" x="330" y="1067" width="64" height="48"/>
+  <text class="bar-text" x="362" y="1091">FFN</text>
+  <rect class="f2a" x="394" y="1067" width="24" height="48"/>
+  <text class="bar-text" x="406" y="1084"><tspan x="406" dy="0">F2A</tspan><tspan x="406" dy="14">send</tspan></text>
+
+  <!-- B1-S0: ready t=24, queued until t=31. -->
+  <text class="small-text" x="474" y="1058">B1-S0</text>
+  <rect class="a2f" x="418" y="1067" width="24" height="48"/>
+  <text class="bar-text" x="430" y="1091">recv</text>
+  <rect class="ffn" x="442" y="1067" width="64" height="48"/>
+  <text class="bar-text" x="474" y="1091">FFN</text>
+  <rect class="f2a" x="506" y="1067" width="24" height="48"/>
+  <text class="bar-text" x="518" y="1084"><tspan x="518" dy="0">F2A</tspan><tspan x="518" dy="14">send</tspan></text>
+
+  <!-- B0-S1: ready t=32, queued until t=45. -->
+  <text class="small-text" x="586" y="1058">B0-S1</text>
+  <rect class="a2f" x="530" y="1067" width="24" height="48"/>
+  <text class="bar-text" x="542" y="1091">recv</text>
+  <rect class="ffn" x="554" y="1067" width="64" height="48"/>
+  <text class="bar-text" x="586" y="1091">FFN</text>
+  <rect class="f2a" x="618" y="1067" width="24" height="48"/>
+  <text class="bar-text" x="630" y="1084"><tspan x="630" dy="0">F2A</tspan><tspan x="630" dy="14">send</tspan></text>
+
+  <!-- B2-S0: ready t=36, queued until t=59. -->
+  <text class="small-text" x="698" y="1058">B2-S0</text>
+  <rect class="a2f" x="642" y="1067" width="24" height="48"/>
+  <text class="bar-text" x="654" y="1091">recv</text>
+  <rect class="ffn" x="666" y="1067" width="64" height="48"/>
+  <text class="bar-text" x="698" y="1091">FFN</text>
+  <rect class="f2a" x="730" y="1067" width="24" height="48"/>
+  <text class="bar-text" x="742" y="1084"><tspan x="742" dy="0">F2A</tspan><tspan x="742" dy="14">send</tspan></text>
+
+  <!-- B1-S1: ready t=47, queued until t=73. -->
+  <text class="small-text" x="810" y="1058">B1-S1</text>
+  <rect class="a2f" x="754" y="1067" width="24" height="48"/>
+  <text class="bar-text" x="766" y="1091">recv</text>
+  <rect class="ffn" x="778" y="1067" width="64" height="48"/>
+  <text class="bar-text" x="810" y="1091">FFN</text>
+  <rect class="f2a" x="842" y="1067" width="24" height="48"/>
+  <text class="bar-text" x="854" y="1084"><tspan x="854" dy="0">F2A</tspan><tspan x="854" dy="14">send</tspan></text>
+
+  <!-- B2-S1: ready t=72, queued until t=87. -->
+  <text class="small-text" x="922" y="1058">B2-S1</text>
+  <rect class="a2f" x="866" y="1067" width="24" height="48"/>
+  <text class="bar-text" x="878" y="1091">recv</text>
+  <rect class="ffn" x="890" y="1067" width="64" height="48"/>
+  <text class="bar-text" x="922" y="1091">FFN</text>
+  <rect class="f2a" x="954" y="1067" width="24" height="48"/>
+  <text class="bar-text" x="966" y="1084"><tspan x="966" dy="0">F2A</tspan><tspan x="966" dy="14">send</tspan></text>
+
+  <line class="axis" x1="170" y1="1140" x2="1770" y2="1140" marker-end="url(#arrow)"/>
+  <g class="small-text">
+    <text x="170" y="1160">0</text><text x="330" y="1160">20</text><text x="490" y="1160">40</text>
+    <text x="650" y="1160">60</text><text x="810" y="1160">80</text><text x="970" y="1160">100</text>
+    <text x="1130" y="1160">120</text><text x="1290" y="1160">140</text><text x="1450" y="1160">160</text>
+    <text x="1610" y="1160">180</text><text x="1770" y="1160">200</text>
+  </g>
+
+  <!-- Legend -->
+  <rect class="attn" x="85" y="1210" width="42" height="28"/>
+  <text class="legend" x="140" y="1224">Attention compute</text>
+  <rect class="ffn" x="350" y="1210" width="42" height="28"/>
+  <text class="legend" x="405" y="1224">FFN compute</text>
+  <rect class="a2f" x="570" y="1210" width="42" height="28"/>
+  <text class="legend" x="625" y="1224">A2F send / recv</text>
+  <rect class="f2a" x="835" y="1210" width="42" height="28"/>
+  <text class="legend" x="890" y="1224">F2A send / recv</text>
+  <rect class="idle" x="1100" y="1210" width="42" height="28"/>
+  <text class="legend" x="1155" y="1224">Exposed idle</text>
+  <line class="rendezvous" x1="1365" y1="1207" x2="1365" y2="1241"/>
+  <text class="legend" x="1380" y="1224">All-input rendezvous</text>
+
+  <line class="section-line" x1="85" y1="1262" x2="1815" y2="1262"/>
+  <text class="takeaway" x="950" y="1304">Dual-stage execution hides local FFN latency; asynchronous AFD additionally removes cross-DP rendezvous bubbles.</text>
+</svg>
