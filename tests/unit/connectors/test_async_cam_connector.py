@@ -1,6 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 import sys
+from collections.abc import Callable
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -31,32 +35,6 @@ from afd_plugin.connectors.npu.async_cam import (  # noqa: E402
 )
 
 
-class _FakeScalar:
-    def __init__(self, value):
-        self._value = int(value)
-
-    def item(self):
-        return self._value
-
-
-class _FakeIntVector:
-    """Stands in for a token-count tensor in fake-torch tests.
-
-    Supports the ``.to(dtype).sum().item()`` chain the connector applies to
-    ``group_list``; ``.to()`` is a no-op so the fake torch's string dtypes
-    cannot leak into a real tensor API.
-    """
-
-    def __init__(self, values):
-        self._values = [int(value) for value in values]
-
-    def to(self, _dtype):
-        return self
-
-    def sum(self):
-        return _FakeScalar(sum(self._values))
-
-
 class _FakeTensorLike:
     def __init__(self, name, *, shape=None, device="npu:0"):
         self.name = name
@@ -75,6 +53,13 @@ class _FakeTensor:
         self.dtype = dtype
         self.device = device
 
+    def to(self, *, dtype):
+        self.dtype = dtype
+        return self
+
+    def contiguous(self):
+        return self
+
     def new_zeros(self, shape):
         return _FakeTensor(shape, dtype=self.dtype, device=self.device)
 
@@ -86,11 +71,11 @@ class _FakeCamOps:
     def __init__(self):
         self.calls = []
 
-    def async_dispatch_send(self, *args):
+    def afd_async_dispatch_send(self, *args):
         self.calls.append(("dispatch_send", args))
         return args[0]
 
-    def async_dispatch_recv(self, *args):
+    def afd_async_dispatch_recv(self, *args):
         self.calls.append(("dispatch_recv", args))
         batch_size = args[3]
         hidden_size = args[4]
@@ -98,19 +83,16 @@ class _FakeCamOps:
         tp_size = args[11]
         return (
             _FakeTensor((batch_size, hidden_size)),
-            _FakeTensor((max(1, batch_size // 2), hidden_size)),
             _FakeTensor((batch_size,), dtype="fp32"),
-            _FakeTensor((max(1, batch_size // 2),), dtype="fp32"),
-            _FakeTensor((5 + tp_size * (2 + expert_per_rank),), dtype="int64"),
+            _FakeTensor((5 + tp_size * (1 + expert_per_rank),), dtype="int64"),
             _FakeTensor((expert_per_rank,), dtype="int64"),
-            _FakeTensor((1,), dtype="int64"),
         )
 
-    def async_combine_send(self, *args):
+    def afd_async_combine_send(self, *args):
         self.calls.append(("combine_send", args))
         return args[0]
 
-    def async_combine_recv(self, *args):
+    def afd_async_combine_recv(self, *args):
         self.calls.append(("combine_recv", args))
         batch_size = args[5]
         hidden_size = args[6]
@@ -124,7 +106,7 @@ class _FakeTorch:
         self.float32 = "fp32"
         self.int32 = "int32"
         self.int64 = "int64"
-        self.ops = SimpleNamespace(umdk_cam_op_lib=_FakeCamOps())
+        self.ops = SimpleNamespace(afd_ascend=_FakeCamOps())
 
     def device(self, name):
         return name
@@ -138,15 +120,22 @@ class _FakeTorch:
 
 def _vllm_config(*, tp_size: int = 1, pcp_size: int = 1, extra_config=None):
     return SimpleNamespace(
-        additional_config={"afd": {"connector_extra_config": extra_config or {}}},
+        additional_config={
+            "afd": {
+                "connector_extra_config": extra_config
+                if extra_config is not None
+                else {"attn_ranks_per_dp": 4},
+            },
+        },
         parallel_config=SimpleNamespace(
             data_parallel_size=1,
             data_parallel_rank=0,
             prefill_context_parallel_size=pcp_size,
             tensor_parallel_size=tp_size,
         ),
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
         model_config=SimpleNamespace(
+            dtype=torch.bfloat16,
             hf_config=SimpleNamespace(
                 hidden_size=16,
                 num_experts_per_tok=2,
@@ -162,6 +151,15 @@ def _afd_config(*, role: str):
         role=role,
         num_attention_ranks=4,
         num_ffn_ranks=2,
+    )
+
+
+def _dp2_afd_config(*, role: str):
+    return AFDConfig(
+        connector="CAMAsyncAFDConnector",
+        role=role,
+        num_attention_ranks=8,
+        num_ffn_ranks=8,
     )
 
 
@@ -227,13 +225,13 @@ def test_async_connector_uses_attn_ranks_per_dp_for_cam_tp_size():
         _vllm_config(
             tp_size=4,
             pcp_size=2,
-            extra_config={"attn_ranks_per_dp": "3"},
+            extra_config={"attn_ranks_per_dp": "4"},
         ),
         _afd_config(role="attention"),
         0,
     )
 
-    assert connector.tp_size == 3
+    assert connector.tp_size == 4
 
 
 @pytest.mark.parametrize("value", [True, "bad"])
@@ -273,8 +271,41 @@ def test_async_topology_uses_cam_attention_first_rank_layout():
     assert ffn.expert_per_rank == 4
 
 
+@pytest.mark.parametrize(
+    ("role", "role_rank", "expected_world_rank"),
+    [
+        ("attention", 3, 3),
+        ("attention", 4, 4),
+        ("ffn", 3, 11),
+        ("ffn", 4, 12),
+    ],
+)
+def test_async_topology_uses_one_world_for_all_dp_replicas(
+    role,
+    role_rank,
+    expected_world_rank,
+):
+    topology = build_async_topology(
+        _dp2_afd_config(role=role),
+        role_rank,
+        num_routed_experts=32,
+    )
+
+    assert topology.world_rank == expected_world_rank
+    assert topology.attn_size == 8
+    assert topology.ffn_size == 8
+    assert topology.world_size == 16
+    assert topology.expert_per_rank == 4
+
+
+def test_async_extra_info_rejects_removed_shared_ffn_pool_option():
+    with pytest.raises(ValueError, match="unknown AFD async connector_extra_config"):
+        AFDAsyncExtraInfo.from_mapping({"shared_ffn_pool": "true"})
+
+
 def test_async_connector_init_creates_attention_first_hccl_group(monkeypatch):
     calls = []
+    pg_options = object()
     fake_torch = _FakeTorch()
     monkeypatch.setattr(async_cam_module, "torch", fake_torch)
     monkeypatch.setattr(
@@ -298,10 +329,15 @@ def test_async_connector_init_creates_attention_first_hccl_group(monkeypatch):
         "init_afd_process_group",
         fake_init_afd_process_group,
     )
+    monkeypatch.setattr(
+        async_cam_module,
+        "create_hccl_process_group_options",
+        lambda hccl_buffer_size_mb: pg_options if hccl_buffer_size_mb == 6144 else None,
+    )
     connector = CAMAsyncAFDConnector(
         0,
         0,
-        _vllm_config(),
+        _vllm_config(extra_config={"hccl_buffer_size": 6144}),
         _afd_config(role="ffn"),
         1,
     )
@@ -311,11 +347,12 @@ def test_async_connector_init_creates_attention_first_hccl_group(monkeypatch):
     assert calls == [
         {
             "backend": "hccl",
-            "init_method": "tcp://127.0.0.1:1239",
             "world_size": 6,
             "rank": 5,
             "group_name": AFD_ASYNC_CAM_GROUP_NAME,
             "timeout": calls[0]["timeout"],
+            "init_method": "tcp://127.0.0.1:1239",
+            "pg_options": pg_options,
         },
     ]
     assert connector.cam_pg is not None
@@ -323,6 +360,45 @@ def test_async_connector_init_creates_attention_first_hccl_group(monkeypatch):
     assert connector.comm_args.shape == (1,)
     assert connector.comm_args.dtype == fake_torch.float16
     assert connector._placeholder.shape == (1,)
+
+
+def test_async_connector_init_uses_one_hccl_group_for_all_dp(monkeypatch):
+    calls = []
+    fake_torch = _FakeTorch()
+    monkeypatch.setattr(async_cam_module, "torch", fake_torch)
+    monkeypatch.setattr(
+        async_cam_module,
+        "ensure_cam_async_ops_available",
+        lambda: None,
+    )
+
+    def fake_init_afd_process_group(**kwargs):
+        calls.append(kwargs)
+        backend = SimpleNamespace(
+            get_hccl_comm_name=lambda rank: f"hccl:{kwargs['group_name']}:{rank}",
+        )
+        return SimpleNamespace(_get_backend=lambda device: backend)
+
+    monkeypatch.setattr(
+        async_cam_module,
+        "init_afd_process_group",
+        fake_init_afd_process_group,
+    )
+    connector = CAMAsyncAFDConnector(
+        0,
+        0,
+        _vllm_config(extra_config={"attn_ranks_per_dp": 4}),
+        _dp2_afd_config(role="ffn"),
+        4,
+    )
+
+    connector.init_afd_connector()
+
+    assert calls[0]["world_size"] == 16
+    assert calls[0]["rank"] == 12
+    assert calls[0]["group_name"] == AFD_ASYNC_CAM_GROUP_NAME
+    assert calls[0]["init_method"] == "tcp://127.0.0.1:1239"
+    assert connector.group_name == "hccl:afd_async_cam:12"
 
 
 def test_async_connector_disables_dp_metadata_control_plane():
@@ -345,7 +421,7 @@ def test_async_connector_calls_cam_shaped_ops(monkeypatch):
         0,
         _vllm_config(
             pcp_size=3,
-            extra_config={"attn_ranks_per_dp": 3},
+            extra_config={"attn_ranks_per_dp": 4},
         ),
         _afd_config(role="attention"),
         0,
@@ -373,18 +449,24 @@ def test_async_connector_calls_cam_shaped_ops(monkeypatch):
 
     assert output is None
     assert combined.shape == (3, 16)
-    assert fake_torch.ops.umdk_cam_op_lib.calls[0][0] == "dispatch_send"
-    assert fake_torch.ops.umdk_cam_op_lib.calls[1][0] == "combine_recv"
-    assert fake_torch.ops.umdk_cam_op_lib.calls[0][1][3] == CAM_COMM_ID
-    assert fake_torch.ops.umdk_cam_op_lib.calls[1][1][4] == CAM_COMM_ID
-    assert fake_torch.ops.umdk_cam_op_lib.calls[0][1][5:11] == (3, 16, 2, 2, 4, 4)
-    assert fake_torch.ops.umdk_cam_op_lib.calls[1][1][5:11] == (3, 16, 2, 2, 4, 4)
-    assert fake_torch.ops.umdk_cam_op_lib.calls[0][1][14] == 3
+    assert fake_torch.ops.afd_ascend.calls[0][0] == "dispatch_send"
+    assert fake_torch.ops.afd_ascend.calls[1][0] == "combine_recv"
+    assert fake_torch.ops.afd_ascend.calls[0][1][3] == CAM_COMM_ID
+    assert fake_torch.ops.afd_ascend.calls[1][1][4] == CAM_COMM_ID
+    assert fake_torch.ops.afd_ascend.calls[0][1][5:11] == (3, 16, 2, 2, 4, 4)
+    assert fake_torch.ops.afd_ascend.calls[1][1][5:11] == (3, 16, 2, 2, 4, 4)
+    assert fake_torch.ops.afd_ascend.calls[0][1][14] == 4
     assert isinstance(context.states, AFDAsyncTransferState)
     assert isinstance(context.states, AFDTransferState)
 
 
 def test_async_ffn_side_dispatch_recv_and_combine_send(monkeypatch):
+    logs = []
+    monkeypatch.setattr(
+        async_cam_module,
+        "_log_cam_op_values",
+        lambda op, label, **values: logs.append((op, label, values)),
+    )
     fake_torch = _FakeTorch()
     monkeypatch.setattr(async_cam_module, "torch", fake_torch)
     connector = CAMAsyncAFDConnector(
@@ -405,20 +487,28 @@ def test_async_ffn_side_dispatch_recv_and_combine_send(monkeypatch):
     connector.send_ffn_output(recv_output.hidden_states, recv_output.context)
 
     states = recv_output.context.states
-    assert recv_output.hidden_states.shape == (4, 16)
-    assert states.dynamic_scales.shape == (4,)
-    assert states.expand_x_shared.shape == (2, 16)
-    assert states.dynamic_scales_shared.shape == (2,)
-    assert states.group_list.shape == (4,)
-    assert states.expert_token_nums_shared.shape == (1,)
-    assert fake_torch.ops.umdk_cam_op_lib.calls[0][0] == "dispatch_recv"
-    assert fake_torch.ops.umdk_cam_op_lib.calls[1][0] == "combine_send"
-    assert fake_torch.ops.umdk_cam_op_lib.calls[0][1][11] == 2
-    assert fake_torch.ops.umdk_cam_op_lib.calls[1][1][13] == 2
-    assert (
-        fake_torch.ops.umdk_cam_op_lib.calls[1][1][3]
-        is states.token_nums_rankid_layeridx
-    )
+    assert recv_output.hidden_states.shape == (connector.max_num_batched_tokens, 16)
+    assert states.dynamic_scales.shape == (connector.max_num_batched_tokens,)
+    assert states.group_list.shape == (connector.topology.expert_per_rank,)
+    assert fake_torch.ops.afd_ascend.calls[0][0] == "dispatch_recv"
+    assert fake_torch.ops.afd_ascend.calls[1][0] == "combine_send"
+    assert fake_torch.ops.afd_ascend.calls[0][1][11] == 2
+    assert fake_torch.ops.afd_ascend.calls[1][1][12] == 2
+    assert fake_torch.ops.afd_ascend.calls[1][1][2] is states.token_nums_rankid_layeridx
+
+    assert [(op, label) for op, label, _ in logs] == [
+        ("async_dispatch_recv", "inputs"),
+        ("async_dispatch_recv", "outputs"),
+        ("async_combine_send", "inputs"),
+    ]
+    assert logs[1][2] == {
+        "hidden_states": recv_output.hidden_states,
+        "dynamic_scales": states.dynamic_scales,
+        "batch_info": states.token_nums_rankid_layeridx,
+        "expert_token_nums": states.group_list,
+    }
+    for index in (0, 2):
+        assert logs[index][2]["max_seq_len"] == connector.max_num_batched_tokens
 
 
 def test_async_combine_send_requires_dispatch_recv_token_metadata(monkeypatch):
@@ -473,16 +563,11 @@ def test_async_ffn_work_item_uses_cam_layer_and_token_metadata(monkeypatch):
             hidden_size=connector.hidden_size,
             topk=connector.topk,
             layer_idx=layer_idx,
-            token_nums_rankid_layeridx=[
-                _FakeScalar(7),
-                _FakeScalar(0),
-                _FakeScalar(11),
-            ],
-            expert_token_nums_shared=[_FakeScalar(2)],
+            token_nums_rankid_layeridx=torch.tensor(
+                [7, 0, 11, 0, 1], dtype=torch.int64
+            ),
             group_list=torch.tensor([2, 3], dtype=torch.int64),
             dynamic_scales=_FakeTensorLike("scales"),
-            expand_x_shared=_FakeTensorLike("shared-hidden"),
-            dynamic_scales_shared=_FakeTensorLike("shared-scales"),
         )
         return AFDA2FTransferPayload(
             hidden_states=_FakeTensorLike("hidden"),
@@ -491,20 +576,20 @@ def test_async_ffn_work_item_uses_cam_layer_and_token_metadata(monkeypatch):
 
     monkeypatch.setattr(connector, "recv_attn_output", fake_recv_attn_output)
 
-    work_item = connector.recv_ffn_work_item(stage_idx=0, max_num_tokens=16)
+    work_item = connector.recv_ffn_work_item(
+        stage_idx=0,
+        max_num_tokens=16,
+    )
 
     states = work_item.context.states
     assert work_item.layer_idx == 11
     assert work_item.stage_idx == 0
     assert work_item.total_num_tokens == 7
-    assert work_item.shared_num_tokens == 2
     assert work_item.num_tokens == 5
     assert work_item.hidden_states == "hidden[:5]"
     assert work_item.context.metadata.layer_idx == 11
     assert work_item.context.metadata.seq_lens == [5]
     assert states.dynamic_scales == "scales[:5]"
-    assert states.expand_x_shared == "shared-hidden[:2]"
-    assert states.dynamic_scales_shared == "shared-scales[:2]"
 
 
 def test_async_ffn_work_item_uses_expert_counts_for_routed_tokens(monkeypatch):
@@ -537,15 +622,10 @@ def test_async_ffn_work_item_uses_expert_counts_for_routed_tokens(monkeypatch):
             hidden_size=connector.hidden_size,
             topk=connector.topk,
             layer_idx=layer_idx,
-            token_nums_rankid_layeridx=[
-                _FakeScalar(6),
-                _FakeScalar(0),
-                _FakeScalar(23),
-            ],
-            expert_token_nums_shared=[_FakeScalar(0)],
+            token_nums_rankid_layeridx=torch.tensor(
+                [6, 0, 23, 0, 15], dtype=torch.int64
+            ),
             group_list=group_list,
-            expand_x_shared=_FakeTensorLike("shared-hidden"),
-            dynamic_scales_shared=_FakeTensorLike("shared-scales"),
         )
         return AFDA2FTransferPayload(
             hidden_states=_FakeTensorLike("hidden"),
@@ -554,24 +634,24 @@ def test_async_ffn_work_item_uses_expert_counts_for_routed_tokens(monkeypatch):
 
     monkeypatch.setattr(connector, "recv_attn_output", fake_recv_attn_output)
 
-    work_item = connector.recv_ffn_work_item(stage_idx=0, max_num_tokens=16)
+    work_item = connector.recv_ffn_work_item(
+        stage_idx=0,
+        max_num_tokens=16,
+    )
 
-    states = work_item.context.states
     assert work_item.layer_idx == 23
     assert work_item.total_num_tokens == 6
-    assert work_item.shared_num_tokens == 0
     assert work_item.num_tokens == 6
     assert work_item.hidden_states == "hidden[:6]"
     assert work_item.context.metadata.seq_lens == [6]
-    assert states.expand_x_shared == "shared-hidden[:0]"
-    assert states.dynamic_scales_shared == "shared-scales[:0]"
 
 
-def test_async_send_ffn_work_item_output_preserves_all_shared_passthrough(
+def test_async_send_ffn_work_item_output_notifies_empty_rank(
     monkeypatch,
 ):
     fake_torch = _FakeTorch()
-    monkeypatch.setattr(async_cam_module, "torch", fake_torch)
+    # Keep real CPU control tensors; only the NPU placeholder allocation is fake.
+    monkeypatch.setattr(async_cam_module.torch, "zeros", fake_torch.zeros)
     connector = CAMAsyncAFDConnector(
         0,
         0,
@@ -597,15 +677,8 @@ def test_async_send_ffn_work_item_output_preserves_all_shared_passthrough(
             hidden_size=connector.hidden_size,
             topk=connector.topk,
             layer_idx=layer_idx,
-            token_nums_rankid_layeridx=[
-                _FakeScalar(5),
-                _FakeScalar(0),
-                _FakeScalar(7),
-            ],
-            expert_token_nums_shared=[_FakeScalar(5)],
-            group_list=_FakeIntVector([0] * 8),
-            expand_x_shared=_FakeTensorLike("shared-hidden"),
-            dynamic_scales_shared=_FakeTensorLike("shared-scales"),
+            token_nums_rankid_layeridx=torch.tensor([0, 0, 7, 0, 7], dtype=torch.int64),
+            group_list=torch.tensor([0] * 8, dtype=torch.int64),
         )
         return AFDA2FTransferPayload(
             hidden_states=_FakeTensorLike("hidden", shape=(5, 16)),
@@ -614,31 +687,30 @@ def test_async_send_ffn_work_item_output_preserves_all_shared_passthrough(
 
     monkeypatch.setattr(connector, "recv_attn_output", fake_recv_attn_output)
 
-    work_item = connector.recv_ffn_work_item(stage_idx=0, max_num_tokens=16)
+    work_item = connector.recv_ffn_work_item(
+        stage_idx=0,
+        max_num_tokens=16,
+    )
     sent_output = connector.send_ffn_work_item_output(
         work_item,
         AFDF2ATransferPayload(
             routed_output="computed-routed",
-            shared_output="computed-shared",
         ),
     )
 
-    # This FFN rank received no routed tokens, so the connector applies the
-    # empty-rank NPU workaround: it replaces the routed output with a single
-    # fake bf16 token and resizes the metadata to one token, while still
-    # passing the computed shared output through untouched.
+    # Empty ranks still send a floating placeholder with untouched zero counts.
     assert work_item.num_tokens == 0
     assert work_item.hidden_states == "hidden[:0]"
-    assert work_item.context.metadata.seq_lens == [1]
+    assert work_item.context.metadata.seq_lens == [0]
     assert isinstance(sent_output, AFDF2ATransferPayload)
-    assert sent_output.shared_output == "computed-shared"
+    assert sent_output.shared_output is None
     assert sent_output.routed_output.shape == (1, 16)
-    assert sent_output.routed_output.dtype == fake_torch.bfloat16
+    assert sent_output.routed_output.dtype == torch.bfloat16
     assert sent_outputs == [
         (
             sent_output.routed_output,
             work_item.context,
-            {"ubatch_idx": 0, "expand_x_shared": "computed-shared"},
+            {"ubatch_idx": 0},
         ),
     ]
 
@@ -648,7 +720,11 @@ def test_async_select_experts_uses_v026_num_experts_contract(monkeypatch):
     fake_package = ModuleType("vllm_ascend")
     fake_ops = ModuleType("vllm_ascend.ops")
     fake_fused_moe = ModuleType("vllm_ascend.ops.fused_moe")
-    fake_selector = ModuleType("vllm_ascend.ops.fused_moe.experts_selector")
+
+    class FakeSelectorModule(ModuleType):
+        select_experts: Callable[..., tuple[str, str]]
+
+    fake_selector = FakeSelectorModule("vllm_ascend.ops.fused_moe.experts_selector")
 
     def select_experts(*, num_experts=-1, **kwargs):
         calls.append((num_experts, kwargs))
@@ -675,3 +751,103 @@ def test_async_select_experts_uses_v026_num_experts_contract(monkeypatch):
 
     assert result == ("weights", "ids")
     assert calls == [(8, {"router_logits": "logits"})]
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_async_receive_anchor_uses_model_dtype(monkeypatch, dtype):
+    fake_torch = _FakeTorch()
+    monkeypatch.setattr(async_cam_module, "torch", fake_torch)
+    monkeypatch.setattr(
+        async_cam_module, "ensure_cam_async_ops_available", lambda: None
+    )
+    backend = SimpleNamespace(get_hccl_comm_name=lambda rank: "source-test")
+    monkeypatch.setattr(
+        async_cam_module,
+        "init_afd_process_group",
+        lambda **kwargs: SimpleNamespace(_get_backend=lambda device: backend),
+    )
+    monkeypatch.setattr(
+        async_cam_module, "create_hccl_process_group_options", lambda _: None
+    )
+    config = _vllm_config()
+    config.model_config.dtype = dtype
+    connector = CAMAsyncAFDConnector(0, 0, config, _afd_config(role="ffn"), 0)
+    connector.init_afd_connector()
+    assert connector._placeholder.dtype == dtype
+
+
+def test_async_rejects_nondivisible_expert_placement():
+    with pytest.raises(ValueError, match="divisible"):
+        build_async_topology(_afd_config(role="ffn"), 0, num_routed_experts=7)
+
+
+def test_async_rejects_fused_shared_expert_ids():
+    from afd_plugin.compat.npu.feature_validation import (
+        _fail_if_unsupported_npu_afd_async_features,
+    )
+
+    config = _vllm_config()
+    config.additional_config["mix_placement"] = True
+    with pytest.raises(RuntimeError, match="routed-only.*mix_placement"):
+        _fail_if_unsupported_npu_afd_async_features(
+            config,
+            _afd_config(role="attention"),
+            AFDAsyncExtraInfo(),
+        )
+
+
+def test_dispatch_failure_does_not_leave_pending_routing(monkeypatch):
+    fake_torch = _FakeTorch()
+    monkeypatch.setattr(async_cam_module, "torch", fake_torch)
+    connector = CAMAsyncAFDConnector(
+        0,
+        0,
+        _vllm_config(),
+        _afd_config(role="attention"),
+        0,
+    )
+    connector._initialized = True
+    connector.comm_args = _FakeTensor((1,), dtype="fp16")
+    context = AFDTransferContext(
+        metadata=AFDTransferMetadata.create_attention_metadata(
+            layer_idx=2,
+            stage_idx=0,
+            seq_len=3,
+        )
+    )
+
+    def fail_dispatch(*_args):
+        raise RuntimeError("dispatch failed")
+
+    monkeypatch.setattr(
+        fake_torch.ops.afd_ascend, "afd_async_dispatch_send", fail_dispatch
+    )
+    with pytest.raises(RuntimeError, match="dispatch failed"):
+        connector.send_attn_output(_FakeTensor((3, 16)), context, **_topk_payload(3))
+    assert connector._pending_attention_payloads == {}
+
+
+def test_close_releases_every_stage_routing(monkeypatch):
+    fake_torch = _FakeTorch()
+    monkeypatch.setattr(async_cam_module, "torch", fake_torch)
+    connector = CAMAsyncAFDConnector(
+        0,
+        0,
+        _vllm_config(),
+        _afd_config(role="attention"),
+        0,
+    )
+    connector._initialized = True
+    connector.comm_args = _FakeTensor((1,), dtype="fp16")
+    for stage in (0, 1):
+        context = AFDTransferContext(
+            metadata=AFDTransferMetadata.create_attention_metadata(
+                layer_idx=2,
+                stage_idx=stage,
+                seq_len=3,
+            )
+        )
+        connector.send_attn_output(_FakeTensor((3, 16)), context, **_topk_payload(3))
+    assert set(connector._pending_attention_payloads) == {0, 1}
+    connector.close()
+    assert connector._pending_attention_payloads == {}

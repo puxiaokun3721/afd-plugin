@@ -1,8 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
+import ast
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -80,7 +85,7 @@ def test_async_model_forward_preserves_pp_boundaries(
         ),
     )
     forward_context = SimpleNamespace()
-    afd_metadata = object()
+    afd_metadata = SimpleNamespace()
     monkeypatch.setattr(async_forward, "get_forward_context", lambda: forward_context)
     monkeypatch.setattr(
         async_forward,
@@ -93,7 +98,7 @@ def test_async_model_forward_preserves_pp_boundaries(
         lambda context: None,
     )
 
-    schedule_calls = []
+    schedule_calls: list[tuple[Any, ...]] = []
 
     def run_schedule(
         model,
@@ -195,27 +200,9 @@ def test_async_cam_profile_forward_runs_matched_connector_io(monkeypatch):
         lambda hidden_states, **_kwargs: hidden_states,
     )
 
-    connector_calls = []
-    pending_outputs = []
-
-    def send_attn_output(hidden_states, context, **kwargs):
-        layer_idx = context.metadata.layer_idx
-        connector_calls.append(("send", layer_idx, context.metadata.stage_idx))
-        pending_outputs.append((layer_idx, hidden_states.clone()))
-
-    def recv_ffn_output(*, ref_tensor, ubatch_idx):
-        layer_idx, dispatched_hidden_states = pending_outputs.pop(0)
-        assert torch.equal(ref_tensor, dispatched_hidden_states)
-        connector_calls.append(("recv", layer_idx, ubatch_idx))
-        return dispatched_hidden_states + 10
-
-    connector = SimpleNamespace(
-        send_attn_output=send_attn_output,
-        recv_ffn_output=recv_ffn_output,
-    )
-    afd_metadata = SimpleNamespace(connector=connector, stage_idx=0)
-
-    dispatch_layouts = []
+    connector_calls: list[str] = []
+    dispatch_layouts: list[object] = []
+    restored_layouts: list[object] = []
 
     def prepare_dispatch_payload(
         hidden_states,
@@ -236,8 +223,6 @@ def test_async_cam_profile_forward_runs_matched_connector_io(monkeypatch):
             layout=layout,
         )
 
-    restored_layouts = []
-
     def restore_dispatch_output(local_output, layout):
         restored_layouts.append(layout)
         return local_output
@@ -253,11 +238,24 @@ def test_async_cam_profile_forward_runs_matched_connector_io(monkeypatch):
         restore_dispatch_output,
     )
 
+    def send_attn_output(*args, **kwargs):
+        connector_calls.append("send")
+
+    def recv_ffn_output(ref_tensor, ubatch_idx):
+        connector_calls.append("recv")
+        return ref_tensor
+
+    connector = SimpleNamespace(
+        send_attn_output=send_attn_output,
+        recv_ffn_output=recv_ffn_output,
+    )
+    afd_metadata = SimpleNamespace(connector=connector, stage_idx=0)
+
     class _ProfileMoELayer:
         is_moe_layer = True
 
-        def __init__(self, layer_idx):
-            self.layer_idx = layer_idx
+        layer_idx = 0
+        mlp = SimpleNamespace(shared_experts=lambda x: 2 * x)
 
         def compute_attn_output(
             self,
@@ -275,7 +273,7 @@ def test_async_cam_profile_forward_runs_matched_connector_io(monkeypatch):
             )
 
     model = SimpleNamespace(
-        layers=[_ProfileMoELayer(0), _ProfileMoELayer(1)],
+        layers=[_ProfileMoELayer(), _ProfileMoELayer()],
         start_layer=0,
         end_layer=2,
     )
@@ -289,16 +287,10 @@ def test_async_cam_profile_forward_runs_matched_connector_io(monkeypatch):
         afd_metadata,
     )
 
-    assert torch.equal(output, hidden_states + 22)
+    assert torch.equal(output, (hidden_states + 1) * 9 + 3)
     assert residual is None
-    assert connector_calls == [
-        ("send", 0, 0),
-        ("recv", 0, 0),
-        ("send", 1, 0),
-        ("recv", 1, 0),
-    ]
+    assert connector_calls == ["send", "recv", "send", "recv"]
     assert restored_layouts == dispatch_layouts
-    assert pending_outputs == []
 
 
 def test_deepseek_afd_wrapper_keeps_full_model_compile_enabled():
@@ -425,7 +417,7 @@ def test_deepseek_compute_gate_on_attention_selects_backend_boundary():
 def test_async_moe_pipeline_preserves_stage_order(monkeypatch):
     from afd_plugin.model_executor.models.npu import deepseek_v2_async_cam_forward
 
-    events = []
+    events: list[tuple[Any, ...]] = []
     forward_context = SimpleNamespace(
         attn_metadata={"layer": "full"},
         additional_kwargs={},
@@ -542,6 +534,9 @@ def test_async_moe_pipeline_preserves_stage_order(monkeypatch):
                 SimpleNamespace(
                     is_moe_layer=True,
                     layer_idx=layer_idx,
+                    mlp=SimpleNamespace(
+                        shared_experts=lambda x, offset=layer_idx + 1: x + offset,
+                    ),
                     compute_attn_output=compute_attn_output,
                 )
                 for layer_idx in range(2)
@@ -578,6 +573,8 @@ def test_async_moe_pipeline_preserves_stage_order(monkeypatch):
         restored is expected
         for restored, expected in zip(output, stage_hidden_states, strict=True)
     )
+    torch.testing.assert_close(output[0], torch.full((1, 8), 4.0))
+    torch.testing.assert_close(output[1], torch.full((2, 8), 8.0))
     assert residual is None
     assert forward_context.attn_metadata == {"layer": "full"}
     assert forward_context.num_tokens == 4
@@ -613,28 +610,59 @@ def test_deepseek_afd_ffn_path_reuses_ascend_moe_mlp_after_attention_gate():
     assert "w13_weight_scale_fp32" in compute_moe
     assert "w13_weight_scale_fp32_list" in compute_moe
     assert "w2_weight_scale_list" in compute_moe
-    assert "MoEQuantParams(quant_type=quant_type)" in compute_moe
+    compute_moe_function = next(
+        node
+        for node in ast.parse(gate_source).body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "compute_attention_gate_moe_ffn"
+    )
+    quant_params_calls = [
+        node
+        for node in ast.walk(compute_moe_function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "MoEQuantParams"
+    ]
+    assert len(quant_params_calls) == 1
+    # Check the contract without pinning formatting or optional quant fields.
+    assert any(
+        keyword.arg == "quant_type"
+        and isinstance(keyword.value, ast.Name)
+        and keyword.value.id == "quant_type"
+        for keyword in quant_params_calls[0].keywords
+    )
     assert "_gmmswigluquant_fusion_enabled()" in compute_moe
     assert "fusion=use_gmmswigluquant_fusion" in compute_moe
     assert "_compute_w8a8_shared_experts_from_int8(" in compute_moe
     assert "shared_input.dtype == torch.int8" in compute_moe
+    assert 'getattr(layer.mlp, "swiglu_limit", None)' in compute_moe
     assert "fusion=False" not in compute_moe
+    assert "output_dtype=torch.int32" in gate_source
+    assert "npu_dequant_swiglu_quant(" in gate_source
+    assert "activation_scale=pertoken_scale" in gate_source
 
 
 @pytest.mark.parametrize(
     ("num_routed_tokens", "num_shared_tokens"),
     [(2, 2), (2, 0), (0, 2), (0, 0)],
 )
+@pytest.mark.parametrize(
+    ("routed_scale_applied_in_topk", "expected_routed_value"),
+    [(False, 2.0), (True, 1.0)],
+)
 def test_deepseek_afd_ffn_skips_empty_rank_local_moe_work(
     monkeypatch,
     num_routed_tokens,
     num_shared_tokens,
+    routed_scale_applied_in_topk,
+    expected_routed_value,
 ):
     from afd_plugin.model_executor.models.npu import deepseek_v2_attention_gate
 
     class FakeQuantType:
         NONE = "none"
         W8A8 = "w8a8"
+        W4A8 = "w4a8"
 
     class KeywordArguments:
         def __init__(self, **kwargs):
@@ -643,27 +671,29 @@ def test_deepseek_afd_ffn_skips_empty_rank_local_moe_work(
     routed_calls = []
 
     def fake_unified_apply_mlp(*, mlp_compute_input):
+        assert mlp_compute_input.quant.quant_type == FakeQuantType.W8A8
+        assert mlp_compute_input.quant.is_per_channel_weight is False
         routed_calls.append(mlp_compute_input.hidden_states)
         return (
-            torch.zeros_like(
+            torch.ones_like(
                 mlp_compute_input.hidden_states,
                 dtype=torch.bfloat16,
             ),
             None,
         )
 
-    fake_moe_mlp = ModuleType("vllm_ascend.ops.fused_moe.moe_mlp")
+    fake_moe_mlp: Any = ModuleType("vllm_ascend.ops.fused_moe.moe_mlp")
     fake_moe_mlp.unified_apply_mlp = fake_unified_apply_mlp
-    fake_stage_contracts = ModuleType(
+    fake_stage_contracts: Any = ModuleType(
         "vllm_ascend.ops.fused_moe.moe_stage_contracts",
     )
     fake_stage_contracts.MoEMlpComputeInput = KeywordArguments
     fake_stage_contracts.MoEWeights = KeywordArguments
-    fake_stage_params = ModuleType(
+    fake_stage_params: Any = ModuleType(
         "vllm_ascend.ops.fused_moe.moe_stage_params",
     )
     fake_stage_params.MoEQuantParams = KeywordArguments
-    fake_quant_type = ModuleType("vllm_ascend.quantization.quant_type")
+    fake_quant_type: Any = ModuleType("vllm_ascend.quantization.quant_type")
     fake_quant_type.QuantType = FakeQuantType
     monkeypatch.setitem(
         sys.modules,
@@ -693,9 +723,12 @@ def test_deepseek_afd_ffn_skips_empty_rank_local_moe_work(
         hidden_states,
         dynamic_scales,
         *,
+        swiglu_limit,
         output_dtype,
     ):
-        shared_calls.append((shared_experts, hidden_states, dynamic_scales))
+        shared_calls.append(
+            (shared_experts, hidden_states, dynamic_scales, swiglu_limit),
+        )
         return torch.zeros_like(hidden_states, dtype=output_dtype)
 
     monkeypatch.setattr(
@@ -720,7 +753,7 @@ def test_deepseek_afd_ffn_skips_empty_rank_local_moe_work(
     layer = SimpleNamespace(
         mlp=SimpleNamespace(
             experts=experts,
-            routed_scaling_factor=1.0,
+            routed_scaling_factor=2.0,
         ),
     )
     hidden_states = torch.zeros((num_routed_tokens, 4), dtype=torch.int8)
@@ -735,15 +768,22 @@ def test_deepseek_afd_ffn_skips_empty_rank_local_moe_work(
         dynamic_scales_shared=torch.ones(num_shared_tokens),
         topk_scales=None,
         group_list_type=1,
+        routed_scale_applied_in_topk=routed_scale_applied_in_topk,
     )
 
     assert len(routed_calls) == int(num_routed_tokens > 0)
     assert output.routed_output.shape == hidden_states.shape
     assert output.routed_output.dtype == torch.bfloat16
+    if num_routed_tokens > 0:
+        assert torch.equal(
+            output.routed_output,
+            torch.full_like(output.routed_output, expected_routed_value),
+        )
     assert len(shared_calls) == int(num_shared_tokens > 0)
     if num_shared_tokens > 0:
         assert output.shared_output is not None
         assert output.shared_output.shape == expand_x_shared.shape
+        assert shared_calls[0][3] is None
     else:
         assert output.shared_output is None
 

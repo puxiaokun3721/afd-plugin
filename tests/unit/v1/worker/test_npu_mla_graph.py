@@ -1,5 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
+# Fake dependency modules in this file intentionally receive attributes at
+# runtime before the plugin module under test imports them.
+# mypy: disable-error-code="attr-defined"
 import importlib
 import sys
 from contextlib import contextmanager
@@ -379,6 +385,22 @@ def test_ubatch_wrapper_rejects_enpu(monkeypatch):
             wrapper_module.CUDAGraphMode.NONE,
             torch.device("cpu"),
             enable_enpu=True,
+        )
+
+
+def test_ubatch_wrapper_requires_native_two_ubatch_config(monkeypatch):
+    wrapper_module = _load_ubatch_wrapper_module(monkeypatch)
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(num_ubatches=0),
+        compilation_config=object(),
+    )
+
+    with pytest.raises(AssertionError):
+        wrapper_module.AscendUBatchWrapper(
+            lambda: None,
+            config,
+            wrapper_module.CUDAGraphMode.NONE,
+            torch.device("cpu"),
         )
 
 
@@ -765,10 +787,9 @@ def test_mla_graph_replay_updates_child_params_each_time_in_runtime_order(monkey
         ),
     )
 
-    def update_params(active_context, num_tokens, positions):
+    def update_params(active_context, num_tokens):
         calls.append("update")
         assert num_tokens == 4
-        assert positions is position_tensor
         assert list(active_context.attn_metadata) == [
             ("layer0", 0),
             ("layer0", 1),
@@ -940,7 +961,7 @@ def test_mla_graph_replay_rejects_missing_capture_registry(monkeypatch):
     )
 
     with pytest.raises(RuntimeError, match="no capture registry"):
-        wrapper._replay_mla_graph(graph_metadata, context, 4, object())
+        wrapper._replay_mla_graph(graph_metadata, context, 4)
 
     assert replay_calls == []
 
@@ -953,6 +974,7 @@ def test_mla_graph_replay_rejects_missing_updater_before_replay(monkeypatch):
     )
     wrapper.full_graph_params_updater = None
     workspace = object()
+    replay_calls: list[str] = []
     graph_metadata = wrapper_module.AscendNPUGraphMetaData(
         aclgraph=SimpleNamespace(replay=lambda: replay_calls.append("replay")),
         ubatch_metadata=[],
@@ -965,9 +987,7 @@ def test_mla_graph_replay_rejects_missing_updater_before_replay(monkeypatch):
         attn_metadata=[{"layer0": "m0"}, {"layer0": "m1"}],
         additional_kwargs={},
     )
-    replay_calls = []
-
     with pytest.raises(RuntimeError, match="no parameter updater"):
-        wrapper._replay_mla_graph(graph_metadata, context, 4, object())
+        wrapper._replay_mla_graph(graph_metadata, context, 4)
 
     assert replay_calls == []

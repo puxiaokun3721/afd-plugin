@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 
@@ -20,6 +20,7 @@ except ImportError:
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
+    from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
     from afd_plugin.model_executor.models.deepseek_v2 import (
         AFDDeepseekV2DecoderLayer,
         _DeepseekAdapterConfig,
@@ -58,7 +59,7 @@ def compute_gate_topk(
             "AFD connector required for compute_gate_on_attention "
             "but not found in forward context",
         )
-    afd_connector = afd_metadata.connector
+    afd_connector = cast("CAMAsyncAFDConnector", afd_metadata.connector)
     mix_placement = bool(
         getattr(vllm_config, "additional_config", {}).get(
             "mix_placement",
@@ -110,8 +111,15 @@ def compute_attention_gate_moe_ffn(
     dynamic_scales_shared: torch.Tensor | None,
     topk_scales: torch.Tensor | None,
     group_list_type: int,
+    routed_scale_applied_in_topk: bool = False,
 ) -> AFDF2ATransferPayload:
-    """Compute FFN output for MoE layers whose gate ran on Attention ranks."""
+    """Compute FFN output for MoE layers whose gate ran on Attention ranks.
+
+    ``routed_scale_applied_in_topk`` records whether the Attention-side gate
+    already folded ``routed_scaling_factor`` into the weights consumed by CAM
+    combine. In that case, scaling every rank-local expert row here would
+    apply the factor twice.
+    """
 
     from vllm_ascend.ops.fused_moe.moe_mlp import unified_apply_mlp
     from vllm_ascend.ops.fused_moe.moe_stage_contracts import (
@@ -157,10 +165,34 @@ def compute_attention_gate_moe_ffn(
                 ],
                 w2_scale=[experts.get_eplb_parameter("w2_weight_scale")],
             )
+    # Mirror AscendW4A8DynamicFusedMoEMethod.apply's weight payload; CAM
+    # already dispatched and quantized the activations, so use only its MLP.
+    elif quant_type == QuantType.W4A8:
+        owner = experts.routed_experts
+        if experts.dynamic_eplb:
+            moe_weights = MoEWeights(
+                w1=[w.view(torch.int32) for w in owner.w13_weight_list],
+                w2=[w.view(torch.int32) for w in owner.w2_weight_list],
+                w1_scale=owner.w13_weight_scale_list,
+                w2_scale=owner.w2_weight_scale_list,
+                w1_scale_bias=owner.w13_scale_bias_list,
+                w2_scale_bias=owner.w2_scale_bias_list,
+            )
+        else:
+            bias1 = owner._parameters.get("w13_scale_bias")
+            bias2 = owner._parameters.get("w2_scale_bias")
+            moe_weights = MoEWeights(
+                w1=[owner.w13_weight],
+                w2=[owner.w2_weight],
+                w1_scale=[owner.w13_weight_scale],
+                w2_scale=[owner.w2_weight_scale],
+                w1_scale_bias=[bias1.detach()] if bias1 is not None else None,
+                w2_scale_bias=[bias2.detach()] if bias2 is not None else None,
+            )
     else:
         raise RuntimeError(
-            "compute_gate_on_attention currently supports only unquantized "
-            f"or W8A8 Ascend MoE experts, got {quant_type}",
+            "compute_gate_on_attention supports unquantized, W8A8 or W4A8 "
+            f"Ascend MoE experts, got {quant_type}",
         )
     use_gmmswigluquant_fusion = (
         quant_type in (QuantType.W8A8, getattr(QuantType, "MXFP8", None))
@@ -180,10 +212,14 @@ def compute_attention_gate_moe_ffn(
         shared_scales = dynamic_scales_shared
         if shared_input.shape[0] > 0:
             if shared_input.dtype == torch.int8 and quant_type == QuantType.W8A8:
+                # DSV4 exposes a SwiGLU clamp limit, while the shared MLP used
+                # by DSV2/V3.2 does not. None preserves the native unclamped
+                # SiluAndMul behavior for those models.
                 shared_output = _compute_w8a8_shared_experts_from_int8(
                     experts._shared_experts,
                     shared_input,
                     shared_scales,
+                    swiglu_limit=getattr(layer.mlp, "swiglu_limit", None),
                     output_dtype=torch.bfloat16,
                 )
             else:
@@ -205,7 +241,19 @@ def compute_attention_gate_moe_ffn(
                 dynamic_scale=dynamic_scales,
                 topk_scales=topk_scales,
                 weights=moe_weights,
-                quant=MoEQuantParams(quant_type=quant_type),
+                quant=MoEQuantParams(
+                    quant_type=quant_type,
+                    is_per_channel_weight=(
+                        experts.routed_experts.quant_method.quant_method.is_per_channel_weight
+                        if quant_type == QuantType.W4A8
+                        else False
+                    ),
+                ),
+                swiglu_limit=(
+                    float(layer.mlp.swiglu_limit or 0.0)
+                    if quant_type == QuantType.W4A8
+                    else 0.0
+                ),
                 fusion=use_gmmswigluquant_fusion,
                 activation=experts.activation,
                 need_trans=False,
@@ -213,10 +261,11 @@ def compute_attention_gate_moe_ffn(
             ),
         )
 
-    if hidden_states.dtype != torch.float16:
-        routed_output *= layer.mlp.routed_scaling_factor
-    elif shared_output is not None:
-        shared_output *= 1.0 / layer.mlp.routed_scaling_factor
+    if not routed_scale_applied_in_topk:
+        if hidden_states.dtype != torch.float16:
+            routed_output *= layer.mlp.routed_scaling_factor
+        elif shared_output is not None:
+            shared_output *= 1.0 / layer.mlp.routed_scaling_factor
 
     return AFDF2ATransferPayload(
         routed_output=routed_output,
@@ -241,11 +290,17 @@ def _dequantize_int8_activation(
     return (hidden_states.to(torch.float32) * scales).to(dtype=output_dtype)
 
 
+# CAM dispatch provides already-quantized shared-expert activations and their
+# per-token scales. Keep W13's accumulator in INT32 so the Ascend fused
+# dequant-SwiGLU-quant operator can consume that scale and produce the INT8
+# input plus scale required by W2. This matches the native W8A8 shared-expert
+# arithmetic while retaining the CAM-specific input contract.
 def _compute_w8a8_shared_experts_from_int8(
     shared_experts: torch.nn.Module,
     hidden_states: torch.Tensor,
     dynamic_scales: torch.Tensor | None,
     *,
+    swiglu_limit: float | None,
     output_dtype: torch.dtype,
 ) -> torch.Tensor:
     if dynamic_scales is None:
@@ -269,19 +324,46 @@ def _compute_w8a8_shared_experts_from_int8(
     quantized_input = quantized_input.clone()
     pertoken_scale = pertoken_scale.clone()
 
+    # ### PATCH START: Preserve CAM INT8 input through fused SwiGLU quantization.
     gate_up = torch_npu.npu_quant_matmul(
         quantized_input,
         shared_experts.gate_up_proj.weight,
         shared_experts.gate_up_proj.weight_scale,
-        pertoken_scale=pertoken_scale,
+        pertoken_scale=None,
+        bias=None,
+        output_dtype=torch.int32,
+    )
+    quantized_activation, activation_scale = (
+        torch.ops._C_ascend.npu_dequant_swiglu_quant(
+            x=gate_up,
+            weight_scale=shared_experts.gate_up_proj.weight_scale_fp32,
+            activation_scale=pertoken_scale,
+            bias=None,
+            quant_scale=None,
+            quant_offset=None,
+            group_index=None,
+            activate_left=True,
+            quant_mode=1,
+            swiglu_mode=1,
+            clamp_limit=0.0 if swiglu_limit is None else swiglu_limit,
+            # CAM Async currently targets hardware that supports these fused
+            # SwiGLU tuning arguments. Revisit this contract before enabling
+            # the path on a profile with narrower operator support.
+            glu_alpha=1.0,
+            glu_bias=0.0,
+        )
+    )
+    shared_output = torch_npu.npu_quant_matmul(
+        quantized_activation,
+        shared_experts.down_proj.weight,
+        shared_experts.down_proj.weight_scale,
+        pertoken_scale=activation_scale,
         bias=None,
         output_dtype=output_dtype,
     )
+    # ### PATCH END: Preserve CAM INT8 input through fused SwiGLU quantization.
     if unsqueeze_output:
-        gate_up = gate_up.unsqueeze(dim=1)
-
-    shared_act = shared_experts.act_fn(gate_up)
-    shared_output, _ = shared_experts.down_proj(shared_act)
+        shared_output = shared_output.unsqueeze(dim=1)
     return shared_output
 
 

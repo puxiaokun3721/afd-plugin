@@ -12,6 +12,12 @@ from pathlib import Path
 import pytest
 
 from tests.conftest import run_runner
+from tests.e2e.environment import (
+    devices_from_env as _devices,
+)
+from tests.e2e.environment import (
+    required_env as _required_env,
+)
 from tests.e2e.runner import (
     ASYNC_CAM_ATTENTION_RANKS,
     ASYNC_CAM_FFN_RANKS,
@@ -21,53 +27,20 @@ from tests.e2e.runner import (
     ASYNC_UBATCH_SCENARIO,
 )
 
-CAM_VENDOR_PATH = Path("/usr/local/Ascend/cann-9.0.1/opp/vendors/CAM")
-CAM_OP_API_PATH = CAM_VENDOR_PATH / "op_api"
-CAM_OP_API_LIB_PATH = CAM_OP_API_PATH / "lib"
-CAM_HCCL_BUFFER_SIZE = "4096"
+CAM_HCCL_BUFFER_SIZE_MB = 4096
 CAM_MAX_NUM_SEQUENCES = "8"
 CAM_MAX_BATCHED_TOKENS = "8000"
 CAM_MEMORY_UTILIZATION = "0.75"
 
 
-def _required_env(name: str) -> str:
-    value = os.environ.get(name)
-    if not value:
-        raise RuntimeError(f"{name} must be set")
-    return value
-
-
-def _devices(name: str, expected_count: int) -> list[str]:
-    devices = [item.strip() for item in _required_env(name).split(",") if item.strip()]
-    if len(devices) != expected_count:
-        raise RuntimeError(f"{name} must contain exactly {expected_count} devices")
-    if len(devices) != len(set(devices)):
-        raise RuntimeError(f"{name} devices must be unique")
-    return devices
-
-
-def _prepend_env_paths(env: dict[str, str], name: str, *paths: Path) -> None:
-    existing = [path for path in env.get(name, "").split(os.pathsep) if path]
-    env[name] = os.pathsep.join(
-        dict.fromkeys([*(str(path) for path in paths), *existing]),
-    )
-
-
 def _async_cam_env() -> dict[str, str]:
     env = os.environ.copy()
+    env.pop("HCCL_BUFFSIZE", None)
     env.setdefault("VLLM_USE_V1", "1")
-    env["HCCL_BUFFSIZE"] = CAM_HCCL_BUFFER_SIZE
     env.setdefault("PYTORCH_NPU_ALLOC_CONF", "expandable_segments:True")
     env.setdefault("ASCEND_LAUNCH_BLOCKING", "1")
     env.setdefault("VLLM_ASCEND_ENABLE_CONTEXT_PARALLEL", "1")
     env.setdefault("VLLM_ASCEND_ENABLE_FLASHCOMM1", "1")
-    _prepend_env_paths(
-        env,
-        "LD_LIBRARY_PATH",
-        CAM_OP_API_PATH,
-        CAM_OP_API_LIB_PATH,
-    )
-    _prepend_env_paths(env, "ASCEND_CUSTOM_OPP_PATH", CAM_VENDOR_PATH)
     return env
 
 
@@ -78,7 +51,13 @@ def _connector_extra_config(model: str) -> str:
             "1" if (Path(model) / "quant_model_description.json").is_file() else "0",
         ),
     )
-    return json.dumps({"dynamicQuant": dynamic_quant}, separators=(",", ":"))
+    return json.dumps(
+        {
+            "dynamicQuant": dynamic_quant,
+            "hccl_buffer_size": CAM_HCCL_BUFFER_SIZE_MB,
+        },
+        separators=(",", ":"),
+    )
 
 
 def build_runner_command() -> list[str]:
@@ -176,6 +155,11 @@ def build_ubatch_runner_command(gsm8k_output_path: Path) -> list[str]:
         ASYNC_UBATCH_SCENARIO,
         "--served-model-name-prefix",
         "cam-async-ubatch",
+        "--afd-connector-extra-config",
+        json.dumps(
+            {"hccl_buffer_size": CAM_HCCL_BUFFER_SIZE_MB},
+            separators=(",", ":"),
+        ),
         "--api-port-base",
         os.environ.get("AFD_NPU_ASYNC_UBATCH_E2E_API_PORT", "19180"),
         "--afd-port",

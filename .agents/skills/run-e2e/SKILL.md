@@ -1,6 +1,6 @@
 ---
 name: run-e2e
-description: Use when the user asks to run, validate, or diagnose the AFD plugin's DeepSeek-V2-Lite GPU/NPU or Qwen3 MoE GPU end-to-end tests, including PR-gate E2E, GSM8K-7 accuracy, graph, eager, DBO, or 2A2F scenarios.
+description: Use when the user asks to run, validate, or diagnose the AFD plugin's DeepSeek-V2-Lite GPU/NPU, Qwen3 MoE GPU, or Qwen3.6 MoE CUDA end-to-end tests through the Qwen3.5/3.6 adapter family, including PR-gate E2E, GSM8K-7 accuracy, graph, eager, DBO, or 2A2F scenarios.
 ---
 
 # Run AFD E2E Tests
@@ -11,17 +11,22 @@ Run one of the model suites:
 
 - `tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py` on GPU or NPU
 - `tests/e2e/models/qwen3_moe/test_qwen3_moe.py` on GPU
+- `tests/e2e/models/qwen3_6/test_qwen3_6.py` on CUDA (text-only Qwen3.6
+  evidence for the Qwen3.5/3.6 adapter family)
 
-Each suite contains four default scenarios:
+Each suite contains four gate scenarios:
 
 - baseline-graph
-- afd-eager
-- afd-graph
-- afd-graph-dbo
+- afd-eager-2a2f (DeepSeek-V2-Lite gate only; Qwen3 MoE/Qwen3.6 use afd-eager-2a1f)
+- afd-graph-2a2f (DeepSeek-V2-Lite gate only; Qwen3 MoE/Qwen3.6 use afd-graph-2a1f)
+- afd-graph-dbo-2a2f (DeepSeek-V2-Lite gate only; Qwen3 MoE/Qwen3.6 use afd-graph-dbo-2a1f)
 
-Each default scenario evaluates the first 7 GSM8K samples. AFD scenarios use
-2 Attention ranks and 1 FFN rank. `baseline-graph` uses native DP4/TP1/EP4.
-`afd-graph-dbo-2a2f` is a separate opt-in case.
+Each gate scenario evaluates the first 7 GSM8K samples. The 2A2F AFD gate
+scenarios (DeepSeek-V2-Lite only) use 2 Attention ranks and 2 FFN ranks.
+`baseline-graph` uses native DP4/TP1/EP4. The 2A1F cases (`afd-eager-2a1f`,
+`afd-graph-2a1f`, `afd-graph-dbo-2a1f`) use 2 Attention ranks and 1 FFN rank.
+Note that for DeepSeek-V2-Lite 2A1F are local-only scenarios, while for Qwen3 MoE and
+Qwen3.6 MoE they are the suite's gate scenarios.
 
 ## Workflow
 
@@ -38,13 +43,21 @@ Before starting pytest, confirm:
 - The backend model variable is set to a local path, or the environment can
   download the selected suite's checkpoint via huggingface_hub.
 - The selected vllm command runs.
-- pytest, afd_plugin, lm_eval, datasets, and huggingface_hub are importable.
+- pytest, afd_plugin, lm_eval, datasets, and huggingface_hub are importable
+  (`uv sync --group dev --group e2e-tests` installs all of these.
 - HF_HOME points to the Hugging Face cache used for GSM8K and model weights.
+- HF_ENDPOINT is reachable: `gsm8k.py` defaults the lm-eval child to
+  `https://hf-mirror.com`, so an unreachable mirror stalls or fails at GSM8K
+  dataset resolution only after the servers are already up and devices
+  reserved. Confirm the default mirror is reachable or override it.
 - GPU: the selected devices are visible to CUDA.
 - NPU: torch_npu and the Ascend runtime work.
 
-Install missing lm_eval only in the runner environment, never in pyproject.toml
-or uv.lock.
+`lm_eval` is declared in the `e2e-tests` uv dependency-group in
+`pyproject.toml` and pinned in `uv.lock` (and baked into the CI image), so
+the runner never needs an ad-hoc `pip install` for it. This keeps E2E runs
+reproducible and removes a manual setup step every runner environment used
+to require by hand.
 
 Fail before pytest when a prerequisite is missing; never turn it into a skip.
 
@@ -75,8 +88,12 @@ export AFD_E2E_DEVICES=0,1,2,3
 # Optional: export AFD_NPU_E2E_VLLM_BIN=/path/to/vllm
 ~~~
 
-Device order defines roles: AFD uses the first two devices for Attention and
-the third for FFN. `baseline-graph` uses the first four for native DP4/TP1/EP4.
+Device order defines roles: the 2A2F AFD scenarios use the first two devices
+for Attention DP2/TP1 and the last two for FFN DP2/TP1/EP2. `baseline-graph`
+uses the first four for native DP4/TP1/EP4.
+The 2A1F scenarios use the first
+two for Attention and the third for FFN (used local-only for DeepSeek-V2-Lite; and
+gate topology for Qwen3 MoE and Qwen3.6 MoE).
 
 ### 4. Run
 
@@ -84,10 +101,10 @@ From the repository root, stream output in the foreground:
 
 ~~~bash
 python -m pytest -q -s \
-  "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py::test_deepseek_v2_lite[afd-eager]" \
-  "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py::test_deepseek_v2_lite[afd-graph]" \
-  "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py::test_deepseek_v2_lite[afd-graph-dbo]" \
-  "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py::test_deepseek_v2_lite[baseline-graph]"
+  "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py::test_deepseek_v2_lite[baseline-graph]" \
+  "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py::test_deepseek_v2_lite[afd-eager-2a2f]" \
+  "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py::test_deepseek_v2_lite[afd-graph-2a2f]" \
+  "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py::test_deepseek_v2_lite[afd-graph-dbo-2a2f]"
 ~~~
 
 For Qwen3 MoE on GPU, run:
@@ -97,19 +114,28 @@ python -m pytest -q -s \
   tests/e2e/models/qwen3_moe/test_qwen3_moe.py
 ~~~
 
-Do not add backend markers or run scenarios in parallel; they share devices.
-
-For the opt-in DeepSeek-V2-Lite GPU/NPU 2A2F case, set four unique device IDs
-and run:
+For Qwen3.6 MoE on CUDA, run:
 
 ~~~bash
+export AFD_E2E_BACKEND=gpu
 export AFD_E2E_DEVICES=0,1,2,3
+export AFD_GPU_E2E_MODEL=/path/to/Qwen3.6-35B-A3B
 python -m pytest -q -s \
-  "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py::test_deepseek_v2_lite[afd-graph-dbo-2a2f]"
+  tests/e2e/models/qwen3_6/test_qwen3_6.py
 ~~~
 
-The first two devices run Attention DP2/TP1. The last two run FFN
-DP2/TP1/EP2.
+The Qwen3.6 suite uses `Qwen/Qwen3.6-35B-A3B`, vLLM V1, and passes
+`--language-model-only` to every runner invocation. It is CUDA-only and
+text-only: `baseline-graph` is native DP4/TP1/EP4, while the AFD scenarios are
+synchronous 2A1F with Attention on the first two devices and FFN on the third.
+Multimodal, NPU, `compute_gate_on_attention=true`, asynchronous,
+pipeline-parallel, and multi-node execution are not covered; quantization is
+unverified.
+
+Do not add backend markers or run scenarios in parallel; they share devices.
+
+For the local DeepSeek-V2-Lite 2A1F cases, run the same pytest entrypoint with
+`[afd-eager-2a1f]`, `[afd-graph-2a1f]`, or `[afd-graph-dbo-2a1f]`.
 
 On cancellation, forward SIGTERM and allow over 90 seconds for cleanup.
 
@@ -130,3 +156,4 @@ gate failure.
 | AFD_NPU_E2E_MODEL | NPU | no; downloads the selected suite's model when unset |
 | AFD_NPU_E2E_VLLM_BIN | NPU | no; defaults to vllm |
 | HF_HOME | both | recommended; HF dataset/model cache |
+| HF_ENDPOINT | both | recommended; `gsm8k.py` defaults the lm-eval child to https://hf-mirror.com, confirm reachable or override |

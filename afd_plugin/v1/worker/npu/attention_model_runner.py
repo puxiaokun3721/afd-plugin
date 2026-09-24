@@ -26,6 +26,7 @@ from vllm.forward_context import (
 from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -98,10 +99,11 @@ from afd_plugin.model_executor.npu.async_cam_ubatching import (
     AsyncMoeStage,
     plan_async_moe_stages,
 )
-from afd_plugin.v1.worker.attention_model_runner import (
+from afd_plugin.v1.worker.attention_metadata import (
     _forward_context_num_tokens,
     _full_cudagraph_padded_tokens,
     _resolve_world_ranks,
+    build_ubatch_dp_metadata_list,
 )
 from afd_plugin.v1.worker.npu.npu_ubatch_wrapper import AscendUBatchWrapper
 from afd_plugin.v1.worker.npu.ubatch_utils import (
@@ -110,7 +112,6 @@ from afd_plugin.v1.worker.npu.ubatch_utils import (
     pad_out_ubatch_slices,
     split_attn_metadata,
 )
-from afd_plugin.v1.worker.ubatch_wrapper import build_ubatch_dp_metadata_list
 
 logger = init_logger(__name__)
 
@@ -124,6 +125,8 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
     """NPU model runner that injects AFD metadata into Ascend forward context."""
 
     afd_expected_role = "attention"
+    model: nn.Module
+    intermediate_tensors: IntermediateTensors | None
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         afd_config = self.parse_config(vllm_config)
@@ -155,10 +158,11 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         # so Attention and FFN weight loading overlap; see that method.
         self._is_warmup = False
         self._afd_is_graph_capturing = False
+        self._afd_is_graph_replaying = False
         self._afd_pending_metadata: AFDForwardContextMetadata | None = None
         self._afd_suppress_metadata_send = False
         self._afd_transaction_counter = 0
-        self._afd_async_moe_ubatch_metadata = None
+        self._afd_async_moe_ubatch_metadata: AsyncMoeUbatchMetadata | None = None
         self._afd_live_execution = False
         self.ubatch_slices = None
         self.prof = create_afd_npu_profiler("attention")
@@ -179,11 +183,14 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         step_afd_npu_profiler(self.prof)
         # ### PATCH START: AFD live execution scope
+        previous_is_graph_replaying = getattr(self, "_afd_is_graph_replaying", False)
+        self._afd_is_graph_replaying = False
         self._afd_live_execution = True
         try:
             result = super().execute_model(scheduler_output, intermediate_tensors)
         finally:
             self._afd_live_execution = False
+            self._afd_is_graph_replaying = previous_is_graph_replaying
         # ### PATCH END: AFD live execution scope
         return result
 
@@ -205,6 +212,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
     ):
         forward_context = get_forward_context()
         # ### PATCH START: AFD forward-context metadata
+        forward_context.input_ids = input_ids
         if self.ubatch_slices is not None:
             forward_context.ubatch_slices = self.ubatch_slices
         forward_context.dbo_enabled = False
@@ -237,14 +245,14 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 num_tokens_padded,
             )
 
-        # ### PATCH START: AFD defers FlashComm gather to the ubatch wrapper
+        # ### PATCH START: AFD defers FlashComm gather to model execution
         if (
             forward_context.flash_comm_v1_enabled
             and not forward_context.dbo_enabled
             and not isinstance(hidden_states, IntermediateTensors)
         ):
             hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
-        # ### PATCH END: AFD defers FlashComm gather to the ubatch wrapper
+        # ### PATCH END: AFD defers FlashComm gather to model execution
         return hidden_states
 
     # Upstream source: vllm-ascend commit 80d8c194f,
@@ -474,7 +482,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             return {}, None
         # ### PATCH START: AFD per-ubatch metadata containers
         assert ubatch_slices is not None
-        attn_metadata: list[dict[str, Any]] = [
+        attn_metadata: list[dict[str, AttentionMetadata]] = [
             dict() for _ in range(len(ubatch_slices))
         ]
         # ### PATCH END: AFD per-ubatch metadata containers
@@ -604,9 +612,9 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             # ### PATCH START: AFD stage-local actual request count
             num_reqs_actual: int,
             # ### PATCH END: AFD stage-local actual request count
-            prefill_ratio_to_sas_metadata: dict[Any, Any],
-            decode_ratio_to_sas_metadata: dict[Any, Any],
-            common_ratio_to_sas_metadata: dict[Any, Any],
+            prefill_ratio_to_sas_metadata: dict[object, object],
+            decode_ratio_to_sas_metadata: dict[object, object],
+            common_ratio_to_sas_metadata: dict[object, object],
             ubid: int | None = None,
         ) -> None:
             attn_group = self.attn_groups[kv_cache_gid][attn_gid]
@@ -708,7 +716,11 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         # makes later stages reuse the first stage's metadata. Preserve the
         # pinned upstream cache and request-count behavior for native DBO.
         if not is_async_moe_stage_build:
-            shared_dsa_metadata_caches = ({}, {}, {})
+            shared_dsa_metadata_caches: tuple[
+                dict[object, object],
+                dict[object, object],
+                dict[object, object],
+            ] = ({}, {}, {})
             dsa_metadata_caches = [shared_dsa_metadata_caches for _ in ubatch_slices]
             num_actual_reqs_per_ubatch = [num_reqs for _ in ubatch_slices]
         else:
@@ -987,7 +999,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         profile_seq_lens: int | None,
         allow_microbatching: bool,
         num_warmups: int,
-        profiler: AbstractContextManager[Any],
+        profiler: AbstractContextManager[object],
     ) -> None:
         force_attention = cudagraph_runtime_mode == CUDAGraphMode.FULL
 
@@ -1499,19 +1511,22 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             dp_metadata_list = {0: dp_metadata}
         is_warmup = bool(self._is_warmup)
         is_graph_capturing = bool(self._afd_is_graph_capturing)
+        is_graph_replaying = bool(getattr(self, "_afd_is_graph_replaying", False))
         payload = AFDControlPayload(
             dp_metadata_list=dp_metadata_list,
             is_graph_capturing=is_graph_capturing,
             is_warmup=is_warmup,
+            is_graph_replaying=is_graph_replaying,
         )
         self.connector.control_plane.update_state_from_dp_metadata(payload)
         logger.warning(
             "AFD NPU Attention send_dp_metadata decision; world_rank=%d "
-            "key=%s is_graph_capturing=%s is_warmup=%s",
-            self.connector.world_rank,
+            "key=%s is_graph_capturing=%s is_warmup=%s is_graph_replaying=%s",
+            self.connector.world_rank,  # type: ignore[attr-defined]
             _dp_metadata_debug_key(dp_metadata_list),
             is_graph_capturing,
             is_warmup,
+            is_graph_replaying,
         )
         self.connector.control_plane.send_dp_metadata_list(payload)
 
@@ -1565,14 +1580,23 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             runtime_mode = CUDAGraphMode.FULL
         elif self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             runtime_mode = CUDAGraphMode.FULL
+        # Only the plain MLA backend owns the merged graph-params registry.
+        # The sparse (SFA) and compressor (DSA) backends define upstream's
+        # update_graph_params as a no-op and register no FIA workspace, which is
+        # why upstream itself skips its graph-params update for them. A
+        # compressor model such as DeepSeek V4 therefore takes the generic
+        # two-stage path instead of the MLA one.
+        mla_full_graph_enabled = (
+            self.vllm_config.model_config.use_mla
+            and not self.use_sparse
+            and not self.use_compress
+        )
         self.model = AscendUBatchWrapper(
             model,
             self.vllm_config,
             runtime_mode,
             self.device,
-            mla_full_graph_enabled=(
-                self.vllm_config.model_config.use_mla and not self.use_sparse
-            ),
+            mla_full_graph_enabled=mla_full_graph_enabled,
             full_graph_params_updater=self._update_full_graph_params_if_needed,
             enable_enpu=self.enable_enpu,
         )
@@ -1831,6 +1855,11 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 num_paddings=batch_descriptor.num_tokens - num_tokens,
                 runtime_mode=str(cudagraph_mode),
             )
+        self._afd_is_graph_replaying = (
+            not bool(getattr(self, "_is_warmup", False))
+            and not bool(getattr(self, "_afd_is_graph_capturing", False))
+            and cudagraph_mode == CUDAGraphMode.FULL
+        )
         return (
             cudagraph_mode,
             batch_descriptor,
@@ -1922,8 +1951,8 @@ def _make_uniform_dp_metadata(dp_size: int, num_tokens: int) -> AFDDPMetadata:
 
 def _dp_metadata_debug_key(
     dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata],
-) -> tuple[tuple[int, tuple]]:
-    key_parts: list[tuple[int, tuple]] = []
+) -> tuple[tuple[int, tuple[int, ...]], ...]:
+    key_parts: list[tuple[int, tuple[int, ...]]] = []
     for stage_idx, metadata in sorted(dp_metadata_list.items()):
         values_tuple = tuple(
             int(value) for value in metadata.num_tokens_across_dp_cpu.tolist()

@@ -18,7 +18,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, cast
 
 import torch
 import torch.distributed as dist
@@ -50,7 +50,11 @@ from afd_plugin.connectors.metadata import (
     recv_control_payload,
     send_control_payload,
 )
-from afd_plugin.distributed import init_afd_process_group, topology_from_config
+from afd_plugin.distributed import (
+    create_hccl_process_group_options,
+    init_afd_process_group,
+    topology_from_config,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -64,6 +68,7 @@ _CAMP2P_EXTRA_CONFIG_FIELDS: Final[frozenset[str]] = frozenset(
         "attn_core_num",
         "ffn_core_num",
         "compute_gate_on_attention",
+        "hccl_buffer_size",
         "quant_mode",
     },
 )
@@ -78,6 +83,7 @@ class CAMP2PExtraInfo(ConnectorExtraInfo):
         attn_core_num: Optional Attention-role override for ``core_num``.
         ffn_core_num: Optional FFN-role override for ``core_num``.
         compute_gate_on_attention: Whether Attention computes MoE gate outputs.
+        hccl_buffer_size: Optional buffer size in MB for CAMP2P HCCL domains.
         quant_mode: CAM quantization mode; the current runtime supports only 0.
     """
 
@@ -85,6 +91,7 @@ class CAMP2PExtraInfo(ConnectorExtraInfo):
     attn_core_num: int | None = None
     ffn_core_num: int | None = None
     compute_gate_on_attention: bool = False
+    hccl_buffer_size: int | None = None
     quant_mode: int = 0
 
     @classmethod
@@ -121,6 +128,10 @@ class CAMP2PExtraInfo(ConnectorExtraInfo):
                 raw.get("compute_gate_on_attention", False),
                 field_name="compute_gate_on_attention",
             ),
+            hccl_buffer_size=coerce_optional_extra_positive_int(
+                raw.get("hccl_buffer_size"),
+                field_name="hccl_buffer_size",
+            ),
             quant_mode=coerce_extra_int(
                 raw.get("quant_mode", 0),
                 field_name="quant_mode",
@@ -152,6 +163,8 @@ class CAMP2PExtraInfo(ConnectorExtraInfo):
             result["attn_core_num"] = self.attn_core_num
         if self.ffn_core_num is not None:
             result["ffn_core_num"] = self.ffn_core_num
+        if self.hccl_buffer_size is not None:
+            result["hccl_buffer_size"] = self.hccl_buffer_size
         return result
 
 
@@ -209,6 +222,90 @@ class _CAMP2PTopology:
     def is_attn_top_min_size_rank(self) -> bool:
         """Return whether this is an Attention metadata-sender rank."""
         return self.ffn_size <= self.world_rank < self.ffn_size + self.min_size
+
+
+def prepare_token_id_transfer(
+    input_ids: torch.Tensor,
+    *,
+    topk: int,
+    expected_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack token ids and inert scales for the A2E ids channel.
+
+    The operator transports an ``int32`` ids tensor and a ``float32`` scales
+    tensor of shape ``(batch, topk)``. The id repeats across the columns, which
+    is what the receiving side collapses back. The scales carry no routing
+    weight: this channel moves token identity, not router output.
+
+    Args:
+        input_ids: Token-aligned ids for the local Attention tokens.
+        topk: Number of routed experts per token; the operator's column count.
+        expected_tokens: Token count the transfer metadata declares.
+
+    Returns:
+        The ``(ids, scales)`` pair to hand to the operator.
+
+    Raises:
+        ValueError: If the ids do not describe exactly ``expected_tokens``
+            tokens, which is the alignment invariant for this channel.
+    """
+
+    num_tokens = int(input_ids.numel())
+    if num_tokens != expected_tokens:
+        raise ValueError(
+            f"input_ids token count {num_tokens} does not match the AFD "
+            f"transfer token count {expected_tokens}",
+        )
+
+    ids = (
+        input_ids.reshape(-1)
+        .to(dtype=torch.int32)
+        .unsqueeze(1)
+        .expand(-1, topk)
+        .contiguous()
+    )
+    scales = torch.zeros(
+        (num_tokens, topk),
+        dtype=torch.float32,
+        device=input_ids.device,
+    )
+    return ids, scales
+
+
+def received_token_ids(
+    sim_expert_ids: torch.Tensor,
+    *,
+    expected_tokens: int,
+) -> torch.Tensor:
+    """Collapse the A2E ids channel back to a token-aligned id vector.
+
+    The operator returns ``(N, topk)`` with every column of a row repeating that
+    token's id, and sizes ``N`` to the capacity it was given, so this trims to
+    the tokens the FFN rank actually computes on.
+
+    Args:
+        sim_expert_ids: The operator's ids output.
+        expected_tokens: Token count derived from the FFN rank's DP metadata,
+            which is what the FFN compute will actually run on.
+
+    Returns:
+        A one-dimensional ``int32`` tensor of length ``expected_tokens``.
+
+    Raises:
+        ValueError: If fewer ids arrived than the FFN rank computes on. That is
+            the misalignment this channel has to catch: a token-keyed router
+            would otherwise select experts for the wrong tokens.
+    """
+
+    received_tokens = int(sim_expert_ids.shape[0])
+    if received_tokens < expected_tokens:
+        raise ValueError(
+            f"received {received_tokens} token ids but the FFN rank computes on "
+            f"{expected_tokens} tokens; the ids channel is not aligned with the "
+            "FFN token layout",
+        )
+    # The columns are replicas of the same id, so the first one carries it.
+    return sim_expert_ids[:expected_tokens, 0].contiguous()
 
 
 class CAMP2pAFDConnector(AFDConnectorBase):
@@ -278,7 +375,9 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         self.hccl_comm_name3 = ""
         self.hccl_comm_name1 = ""
         self.hccl_comm_name_list: list[str] = []
-        self.aiv_num = self.extra_info.aiv_num_for_role(afd_config.role)
+        extra_info = cast(CAMP2PExtraInfo, self.extra_info)
+        self.aiv_num = extra_info.aiv_num_for_role(afd_config.role)
+        self.hccl_buffer_size_mb = extra_info.hccl_buffer_size
         hf_config = vllm_config.model_config.hf_config
         self.hidden_size = hf_config.hidden_size
         self.num_experts_per_tok = hf_config.num_experts_per_tok
@@ -325,6 +424,9 @@ class CAMP2pAFDConnector(AFDConnectorBase):
                 rank=self.world_rank,
                 group_name=group_name,
                 timeout=timedelta(minutes=30),
+                pg_options=create_hccl_process_group_options(
+                    self.hccl_buffer_size_mb,
+                ),
             )
             self.afd_pg_list.append(afd_pg)
             backend = afd_pg._get_backend(torch.device("npu"))
@@ -346,6 +448,9 @@ class CAMP2pAFDConnector(AFDConnectorBase):
                 rank=self.world_rank,
                 group_name="afd_moe",
                 timeout=timedelta(minutes=30),
+                pg_options=create_hccl_process_group_options(
+                    self.hccl_buffer_size_mb,
+                ),
             )
             backend = self.ffn_pg._get_backend(torch.device("npu"))
             self.hccl_comm_name1 = str(
@@ -408,12 +513,17 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             hidden_states: Model data with shape ``(tokens, hidden_size)``.
             context: Transfer context whose ``metadata`` supplies the layer
                 number, ubatch number, and token count for this transfer.
-            **kwargs: Extra arguments accepted for interface compatibility.
+            **kwargs: An optional token-aligned ``input_ids`` tensor. When it is
+                supplied, the transfer runs with ``compute_gate=1`` so the ids
+                reach the FFN rank through the operator's ids channel, and the
+                matching ``recv_attn_output(recv_input_ids=True)`` returns them
+                on the payload's ``input_ids`` field.
 
         Raises:
             RuntimeError: If the communication groups are not ready.
             ValueError: If the number of tokens in ``hidden_states`` does not
-                match ``context.metadata`` outside a ``torch.compile`` trace.
+                match ``context.metadata`` outside a ``torch.compile`` trace, or
+                if a supplied ``input_ids`` tensor is malformed.
         """
         if not self._initialized:
             raise RuntimeError("CAMP2P connector is not initialized")
@@ -425,6 +535,17 @@ class CAMP2pAFDConnector(AFDConnectorBase):
                 f"hidden_states shape {hidden_states.shape!r} does not match "
                 f"CAMP2P metadata token count {metadata.total_tokens}",
             )
+        input_ids = cast(torch.Tensor | None, kwargs.get("input_ids"))
+        expert_ids: torch.Tensor | None = None
+        expert_scales: torch.Tensor | None = None
+        compute_gate = 0
+        if input_ids is not None:
+            expert_ids, expert_scales = prepare_token_id_transfer(
+                input_ids,
+                topk=self.num_experts_per_tok,
+                expected_tokens=metadata.total_tokens,
+            )
+            compute_gate = 1
         transfer_state = CAMP2PTransferState(
             aiv_num=self.aiv_num,
             batch_size=metadata.total_tokens,
@@ -448,7 +569,9 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             self.attn_size,
             self.world_rank,
             transfer_state.aiv_num,
-            0,
+            compute_gate,
+            expert_ids,
+            expert_scales,
         )
         return None
 
@@ -505,20 +628,30 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         Args:
             ubatch_idx: Ubatch number, starting from ``0``.
             **kwargs: May provide existing transfer information or the layer
-                number needed to create it.
+                number needed to create it. ``recv_input_ids`` states that this
+                FFN rank expects token ids on the transfer, which selects the
+                operator's ids mode and makes the connector validate and expose
+                the operator's ids slot on the payload. The sending rank has to
+                select the same mode, so only request ids for a run whose
+                Attention role transports them.
 
         Returns:
-            The received hidden states and the information FFN needs to process
-            them and send the result back.
+            The received hidden states, the information FFN needs to process them
+            and send the result back, and the transported ``input_ids`` when the
+            ids mode was selected.
 
         Raises:
             RuntimeError: If communication is not ready, transfer information
                 is missing, or the requested ubatch group does not exist.
+            ValueError: If ids were requested but do not align with the FFN
+                rank's token layout.
         """
         if not self._initialized:
             raise RuntimeError("CAMP2P connector is not initialized")
         layer_idx: int = kwargs.get("layer_idx", 0)
         max_num_tokens: int = kwargs.get("max_num_tokens", 0)
+        recv_input_ids: bool = bool(kwargs.get("recv_input_ids", False))
+        compute_gate_mode = 1 if recv_input_ids else 0
         batch_size = _num_tokens_for_ffn_rank(
             self.dp_metadata_list,
             ubatch_idx,
@@ -561,14 +694,28 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             self.world_rank,
             group_ep,
             custom_states.aiv_num,
-            0,
+            compute_gate_mode,
         )
         custom_states.atten_batch_size = outputs[3]
         custom_states.x_active_mask = outputs[4]
         custom_states.cam_p2p_ep_name = self.hccl_comm_name1
+        # The ids slot is only written in the operator's ids mode, so the mode has
+        # to match the sending rank's ``compute_gate``. It is declared here by the
+        # receiving FFN rank through ``recv_input_ids`` rather than inferred from
+        # the returned tensor: a genuine single-token layer would otherwise be
+        # indistinguishable from the operator's placeholder. Reading the slot in
+        # the other mode would hand the model uninitialised device memory as token
+        # ids, which a token-keyed router turns into an out-of-range table read.
+        received_ids: torch.Tensor | None = None
+        if compute_gate_mode == 1:
+            received_ids = received_token_ids(
+                outputs[1],
+                expected_tokens=batch_size,
+            )
         return AFDA2FTransferPayload(
             hidden_states=outputs[0],
             context=context,
+            input_ids=received_ids,
         )
 
     def send_ffn_output(
@@ -592,7 +739,7 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         """
         if not self._initialized:
             raise RuntimeError("CAMP2P connector is not initialized")
-        states = context.states
+        states = cast(CAMP2PTransferState, context.states)
         if states.atten_batch_size is None:
             raise RuntimeError("CAMP2P FFN side is missing A2E atten_batch_size")
         ubatch_idx = int(kwargs.get("ubatch_idx", context.metadata.stage_idx))
@@ -829,6 +976,8 @@ def _register_camp2p_custom_ops() -> None:
         world_rank: int,
         aiv_num: int,
         compute_gate: int,
+        expert_ids: torch.Tensor | None,
+        expert_scales: torch.Tensor | None,
     ) -> torch.Tensor:
         transfer_state = getattr(get_forward_context(), "cam_afdtransfer_state", None)
         if transfer_state is None:
@@ -846,8 +995,8 @@ def _register_camp2p_custom_ops() -> None:
 
         outputs = torch.ops.afd_ascend.a2e(
             hidden_states,
-            None,
-            None,
+            expert_ids,
+            expert_scales,
             transfer_state.batch_size,
             transfer_state.h,
             transfer_state.k,
@@ -876,6 +1025,8 @@ def _register_camp2p_custom_ops() -> None:
         world_rank: int,
         aiv_num: int,
         compute_gate: int,
+        expert_ids: torch.Tensor | None,
+        expert_scales: torch.Tensor | None,
     ) -> torch.Tensor:
         """Return the input unchanged while PyTorch inspects the send operation."""
         return hidden_states
@@ -949,6 +1100,8 @@ def _register_camp2p_custom_ops() -> None:
         "world_rank": int,
         "aiv_num": int,
         "compute_gate": int,
+        "expert_ids": torch.Tensor | None,
+        "expert_scales": torch.Tensor | None,
         "return": torch.Tensor,
     }
     recv_annotations = {

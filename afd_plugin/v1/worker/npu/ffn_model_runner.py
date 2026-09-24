@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import torch
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
@@ -12,6 +12,7 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import DPMetadata
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm_ascend import ascend_forward_context as ascend_context
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner, graph_capture
 
 from afd_plugin.compat.npu import (
@@ -36,7 +37,7 @@ from afd_plugin.connectors.npu.async_cam import (
     AFDAsyncTransferState,
     CAMAsyncAFDConnector,
 )
-from afd_plugin.v1.worker.attention_model_runner import (
+from afd_plugin.v1.worker.attention_metadata import (
     _resolve_world_ranks,
 )
 from afd_plugin.v1.worker.cuda_graph import (
@@ -79,6 +80,14 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             vllm_config,
             self.afd_config,
         )
+        if (
+            isinstance(self.connector, CAMAsyncAFDConnector)
+            and self.afd_config.compute_gate_on_attention
+            and not vllm_config.use_v2_model_runner
+        ):
+            # This dedicated CAM FFN process never consumes the native MC2 mask.
+            # Clear it after super().__init__ so upstream skips per-step fills.
+            ascend_context._reserved_mc2_mask = None
         self.num_layers = int(self.model_config.hf_config.num_hidden_layers)
         self.use_aclgraph = _use_npu_aclgraph(vllm_config, self)
         self._acl_graphs: dict[tuple, dict[str, Any]] = {}
@@ -110,6 +119,8 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata],
         is_graph_capturing: bool = False,
         is_warmup: bool = False,
+        is_profile: bool = False,
+        is_graph_replaying: bool = False,
     ) -> None:
         if dp_metadata_list is None:
             raise RuntimeError("AFD NPU FFN requires dp_metadata_list")
@@ -127,7 +138,11 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 is_attn_graph_capturing=is_graph_capturing,
             )
             return None
-        self.execute_model(dp_metadata_list=dp_metadata_list)
+        self.execute_model(
+            dp_metadata_list=dp_metadata_list,
+            is_profile=is_profile,
+            is_graph_replaying=is_graph_replaying,
+        )
         return None
 
     def execute_connector_driven_step(self) -> None:
@@ -148,6 +163,8 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata] | None = None,
         is_graph_capturing: bool = False,
         is_warmup: bool = False,
+        is_profile: bool = False,
+        is_graph_replaying: bool = False,
     ) -> None:
         step_afd_npu_profiler(self.prof)
         if dp_metadata_list is None:
@@ -159,10 +176,12 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         run_mode = graph_run_mode(
             is_warmup=is_warmup and graph_enabled,
             is_graph_capturing=is_graph_capturing and graph_enabled,
+            is_graph_replaying=is_graph_replaying,
             graph_enabled=graph_enabled,
             graph_exists=graph_info is not None,
         )
         if run_mode is AFDGraphRunMode.REPLAY:
+            assert graph_info is not None
             logger.debug(
                 "AFD NPU FFN replaying ACL graph; key=%s cached_graphs=%d",
                 graph_key,
@@ -177,7 +196,10 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 is_warmup=is_warmup,
             )
 
-        self._ffn_forward(dp_metadata_list=dp_metadata_list)
+        self._ffn_forward(
+            dp_metadata_list=dp_metadata_list,
+            is_profile=is_profile,
+        )
         return None
 
     def _make_graph_key(
@@ -198,6 +220,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         aclgraph_runtime_mode: CUDAGraphMode | None = None,
         is_graph_capturing: bool = False,
         update_connector_state: bool = True,
+        is_profile: bool = False,
     ) -> torch.Tensor | None:
         if update_connector_state:
             assert self.connector.control_plane, (
@@ -221,6 +244,10 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         )
         stage_ids = sorted(int(stage_idx) for stage_idx in dp_metadata_list) or [0]
         rank_ffn_output = None
+        # A model whose router is keyed by token identity declares that the FFN
+        # role needs the tokens' ids. Resolve it once per forward, outside the
+        # layer loop, so a per-layer re-read cannot drift within a step.
+        recv_input_ids = getattr(self.model, "afd_requires_input_ids", False)
 
         for layer_idx in _ffn_layer_indices(self):
             for stage_idx in stage_ids:
@@ -241,23 +268,32 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                     num_tokens_across_dp,
                     dp_size=int(self.vllm_config.parallel_config.data_parallel_size),
                 )
+                # A model whose router is keyed by token identity needs the ids
+                # of the tokens this rank computes on installed in the forward
+                # context before the FFN compute runs. They arrive on the
+                # transfer payload, so the receive must happen before the
+                # context is built rather than inside it.
+                payload = self.connector.recv_attn_output(
+                    ubatch_idx=stage_idx,
+                    layer_idx=layer_idx,
+                    max_num_tokens=self.max_num_tokens,
+                    recv_input_ids=recv_input_ids,
+                )
+                context = payload.context
+                metadata = context.metadata
+                states = context.states
+                hidden_states = payload.hidden_states
+                received_input_ids = payload.input_ids
                 with ascend_forward_context(
                     vllm_config=self.vllm_config,
                     afd_metadata=afd_metadata,
                     model_instance=self.model,
                     num_tokens=num_tokens,
                     num_tokens_across_dp=dp_num_tokens_across_dp,
+                    in_profile_run=is_profile,
                     aclgraph_runtime_mode=aclgraph_runtime_mode,
+                    input_ids=received_input_ids,
                 ) as forward_context:
-                    payload = self.connector.recv_attn_output(
-                        ubatch_idx=stage_idx,
-                        layer_idx=layer_idx,
-                        max_num_tokens=self.max_num_tokens,
-                    )
-                    context = payload.context
-                    metadata = context.metadata
-                    states = context.states
-                    hidden_states = payload.hidden_states
                     metadata.layer_idx = layer_idx
                     metadata.stage_idx = stage_idx
                     forward_context.dp_metadata = dp_metadata_list.get(stage_idx)
@@ -313,6 +349,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 afd_metadata=afd_metadata,
                 model_instance=self.model,
                 num_tokens=num_tokens,
+                skip_mc2_mask=self.afd_config.compute_gate_on_attention,
             ) as forward_context:
                 forward_context.dp_metadata = None
                 forward_context.additional_kwargs["afd_metadata"] = metadata
@@ -323,8 +360,6 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                     layer_idx=layer_idx,
                     group_list=states.group_list,
                     dynamic_scales=states.dynamic_scales,
-                    expand_x_shared=states.expand_x_shared,
-                    dynamic_scales_shared=states.dynamic_scales_shared,
                 )
                 rank_ffn_output = connector.send_ffn_work_item_output(
                     work_item,
@@ -478,9 +513,12 @@ def _ffn_layer_indices(runner: AFDNPUFFNModelRunner) -> range | list[int]:
 
 def _is_moe_layer(hf_config: object, layer_idx: int) -> bool:
     moe_layer_freq = getattr(hf_config, "moe_layer_freq", 1)
+    # DeepSeek V4 has routed experts in every decoder layer and does not expose
+    # the V2/V3 ``first_k_dense_replace`` compatibility field.
+    first_moe_layer = getattr(hf_config, "first_k_dense_replace", 0)
     return (
-        hf_config.n_routed_experts is not None
-        and layer_idx >= hf_config.first_k_dense_replace
+        getattr(hf_config, "n_routed_experts", None) is not None
+        and layer_idx >= first_moe_layer
         and layer_idx % moe_layer_freq == 0
     )
 
@@ -543,7 +581,10 @@ def _ffn_token_count_for_rank(
     num_tokens_across_dp: torch.Tensor,
 ) -> int:
     values = _to_int_list(num_tokens_across_dp)
-    role_rank = int(connector.topology.role_rank)
+    topology = getattr(connector, "topology", None)
+    if topology is None:
+        raise RuntimeError("AFD connector has no initialized topology")
+    role_rank = int(topology.role_rank)
     if role_rank >= len(values):
         return max(1, values[0] if values else 1)
     return max(1, int(values[role_rank]))
@@ -556,7 +597,7 @@ def _to_int_list(value: object) -> list[int]:
         return [int(value)]
     if isinstance(value, (list, tuple)):
         return [int(item) for item in value]
-    return [int(item) for item in value.tolist()]
+    return [int(item) for item in torch.as_tensor(value).flatten().tolist()]
 
 
 def _to_dp_level_token_counts(
@@ -582,7 +623,11 @@ def _to_dp_level_token_counts(
     return num_tokens_across_dp[indices].contiguous()
 
 
-def _use_npu_aclgraph(vllm_config: VllmConfig, runner: object) -> bool:
+class _ACLGraphRunner(Protocol):
+    use_aclgraph: bool
+
+
+def _use_npu_aclgraph(vllm_config: VllmConfig, runner: _ACLGraphRunner) -> bool:
     inherited = bool(runner.use_aclgraph)
     if bool(vllm_config.model_config.enforce_eager):
         return False

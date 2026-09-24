@@ -7,13 +7,15 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
-from contextlib import suppress
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from importlib.util import find_spec
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-# Covers the roughly 64-second nested lm-eval/vLLM cleanup bound with buffer.
-RUNNER_CLEANUP_TIMEOUT_S = 90
+# Covers the roughly 64-second nested lm-eval/vLLM cleanup bound plus the NPU
+# async runner's 120-second procfs cleanup window with buffer.
+RUNNER_CLEANUP_TIMEOUT_S = 240
 
 # vLLM-Ascend 80d8c194f (v0.26 baseline) has an inherent circular import:
 # device/device_op.py -> ops/__init__ -> fused_moe -> experts_selector.py ->
@@ -24,6 +26,19 @@ RUNNER_CLEANUP_TIMEOUT_S = 90
 # package is installed, import and ABI failures must remain visible.
 if find_spec("vllm_ascend") is not None:  # pragma: no cover - environment-dependent
     import vllm_ascend.ops  # noqa: F401
+
+
+@contextmanager
+def preserve_environment_variable(name: str) -> Iterator[None]:
+    """Restore an environment variable after a temporary E2E asset override."""
+    original_value = os.environ.get(name)
+    try:
+        yield
+    finally:
+        if original_value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = original_value
 
 
 def run_runner(command: list[str], env: dict[str, str] | None = None) -> None:
@@ -87,6 +102,10 @@ def download_dataset(dataset_id: str, dataset_config: str | None = None) -> None
         dataset_id: Dataset repo id, e.g. ``openai/gsm8k``.
         dataset_config: Optional dataset configuration name, e.g. ``main``.
     """
+    # Must be set before ``datasets`` transitively imports huggingface_hub,
+    # which reads HF_HUB_DISABLE_XET once at import time.
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
     from datasets import load_dataset
 
     if dataset_config is None:

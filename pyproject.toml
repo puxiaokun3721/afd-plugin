@@ -48,11 +48,15 @@ afd = "afd_plugin:register_afd"
 [dependency-groups]
 dev = [
     "datasets>=3.0",
+    "httpx>=0.27",
     "huggingface_hub>=0.26",
     "pre-commit>=4",
     "pytest>=7.0",
     "ruff>=0.15.7,<0.16",
     "setuptools-scm>=8",
+]
+e2e-tests = [
+    "lm_eval[api]==0.4.12",
 ]
 
 [tool.setuptools_scm]
@@ -111,7 +115,74 @@ quote-style = "double"
 indent-style = "space"
 docstring-code-format = true
 
+[tool.mypy]
+python_version = "3.10"
+# Silent follow for library code; missing third-party stubs are ignored
+# everywhere (including tests). tests/ still get --follow-imports skip from
+# tools/pre_commit/mypy.py.
+ignore_missing_imports = true
+check_untyped_defs = true
+follow_imports = "silent"
+
 [tool.ty]
 
 [tool.ty.analysis]
 allowed-unresolved-imports = ["torch.**", "vllm.**"]
+
+[tool.typos.default]
+extend-ignore-words-re = [
+    # Ascend domain terms checked as plain words in docs/comments.
+    "(?i)^cann$",
+    "(?i)^tbe$",
+]
+extend-ignore-identifiers-re = [
+    ".*_thw",
+    ".*thw",
+    "ein",
+    ".*arange",
+    ".*MoBA",
+    ".*temperal_downsample",
+    ".*nd",
+    ".*[Nn][Dd]$",
+    ".*EmbedND$",
+    ".*nothink.*",
+    ".*NOTHINK.*",
+    ".*nin.*",
+    ".*[Oo]no.*[Aa]nna.*",
+    ".*cann.*",
+    "alog",
+    ".*alog.*",
+    ".*[Nn][Dd]3.*",
+    ".*updator.*",
+    "byt5.*",
+    # NemotronVoiceChat vendored triton kernel: dout/DOUT abbreviate d_out
+    # (output feature dim), not "doubt".
+    ".*dout.*",
+    ".*DOUT.*",
+    # Vendored CANN/AscendC identifiers under csrc/npu/ascend_kernels/ whose
+    # camelCase segments spell a word the dictionary flags. These are part of
+    # the CANN API surface (renaming them breaks compilation against the CANN
+    # headers) or upstream spellings kept as-is so the vendored tree stays
+    # diffable against its origin. The `nd`/`ND` entries above only match a
+    # trailing or all-lowercase `nd`, not a mid-identifier camelCase segment.
+    # ND->NZ copies and their stride/param names.
+    ".*[Nn]d2[Nn]z.*",
+    ".*[Nn]d[A-Z].*",
+    # ND_ALIGN, ND_WEIGHT_DIM_LIMIT, ND_WEIGHT_MULTI_TENSOR_DIM, MIN_ND_DIM.
+    ".*ND_WEIGHT.*",
+    ".*MIN_ND_DIM.*",
+    ".*ND_ALIGN.*",
+    # CANN registration macro.
+    ".*REGIST_MATMUL_OBJ.*",
+    # Upstream-spelled local names: preGoupList, reformatedTensor,
+    # reformatedWeight, isFisrtBlock, copyedL1Left, worskspaceOffset,
+    # DataCopyPad2DA8W4NDNew, isND2NZ, enVecND2NZ.
+    ".*[Gg]oup.*",
+    ".*reformated.*",
+    ".*Fisrt.*",
+    ".*copyed.*",
+    ".*worskspace.*",
+    "DataCopyPad2DA8W4NDNew",
+    ".*isND2NZ.*",
+    ".*enVecND2NZ.*",
+]

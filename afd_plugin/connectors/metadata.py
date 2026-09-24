@@ -9,7 +9,7 @@ import json
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import torch
 from vllm.forward_context import DPMetadata
@@ -45,7 +45,7 @@ class AFDDPMetadata:
 
     @contextmanager
     def sp_local_sizes(self, sequence_parallel_size: int) -> Generator[list[int]]:
-        self.local_sizes = (
+        local_sizes: list[int] = (
             (
                 (self.num_tokens_across_dp_cpu + sequence_parallel_size - 1)
                 // sequence_parallel_size
@@ -53,8 +53,9 @@ class AFDDPMetadata:
             .repeat_interleave(sequence_parallel_size)
             .tolist()
         )
+        self.local_sizes = local_sizes
         try:
-            yield self.local_sizes
+            yield local_sizes
         finally:
             self.local_sizes = None
 
@@ -123,11 +124,19 @@ class AFDControlPayload:
         is_warmup: Whether the payload belongs to a warmup step. This is
             separate from graph capture because warmup may prepare state without
             representing a real serving step.
+        is_graph_replaying: Whether the Attention side is currently replaying a
+            captured graph for this step. FFN may replay only when this is True
+            and a matching local graph exists.
+        is_profile: Whether the payload belongs to an initial memory-profile
+            forward. NPU FFN workers use this to preserve Ascend's balanced
+            dummy MoE routing in the split-process AFD execution model.
     """
 
     dp_metadata_list: dict[int, AFDDPMetadata]
     is_graph_capturing: bool
     is_warmup: bool
+    is_graph_replaying: bool = False
+    is_profile: bool = False
 
     def __post_init__(self) -> None:
         self.dp_metadata_list = {
@@ -305,29 +314,32 @@ class AFDForwardContextMetadata:
 
 def _to_int(value: object) -> int:
     item = getattr(value, "item", None)
-    return int(item() if callable(item) else value)
+    return int(cast(Any, item() if callable(item) else value))
 
 
 def encode_control_payload(payload: AFDControlPayload) -> bytes:
     """Serialize an ``AFDControlPayload`` to a compact JSON byte string.
 
     Only ``num_tokens_across_dp_cpu`` / ``max_tokens_across_dp_cpu`` per stage
-    and the graph-capturing / warmup flags are carried; these are the fields the
-    FFN-side connectors read back after decode. Serializing to a plugin-owned
-    minimal schema keeps the wire format decoupled from vLLM-internal DP
-    metadata objects.
+    and the graph-capturing, warmup, replay, and profile flags are carried.
+    These are the fields the FFN-side connectors read back after decode. A
+    plugin-owned minimal schema keeps the wire format decoupled from
+    vLLM-internal DP metadata objects.
     """
     metadata_payload: dict[str, dict[str, int | list[int]]] = {}
     for stage_idx, dp_metadata in payload.dp_metadata_list.items():
-        metadata_payload[str(int(stage_idx))] = {
+        stage_payload: dict[str, int | list[int]] = {
             "num_tokens_across_dp_cpu": dp_metadata.num_tokens_across_dp_cpu.tolist(),
             "max_tokens_across_dp_cpu": _to_int(dp_metadata.max_tokens_across_dp_cpu),
         }
+        metadata_payload[str(int(stage_idx))] = stage_payload
 
     wire_payload = {
         "dp_metadata_list": metadata_payload,
         "is_graph_capturing": bool(payload.is_graph_capturing),
         "is_warmup": bool(payload.is_warmup),
+        "is_graph_replaying": bool(payload.is_graph_replaying),
+        "is_profile": bool(payload.is_profile),
     }
     return json.dumps(wire_payload, separators=(",", ":"), sort_keys=True).encode(
         "utf-8",
@@ -356,6 +368,8 @@ def decode_control_payload(payload_bytes: bytes) -> AFDControlPayload:
         dp_metadata_list=dp_metadata_list,
         is_graph_capturing=bool(payload.get("is_graph_capturing", False)),
         is_warmup=bool(payload.get("is_warmup", False)),
+        is_graph_replaying=bool(payload.get("is_graph_replaying", False)),
+        is_profile=bool(payload.get("is_profile", False)),
     )
 
 

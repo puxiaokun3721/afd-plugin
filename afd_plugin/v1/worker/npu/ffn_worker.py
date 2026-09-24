@@ -9,8 +9,11 @@ import threading
 from typing import TYPE_CHECKING, Any
 
 import torch
+from vllm.platforms import current_platform
 from vllm.v1.worker.worker_base import CompilationTimes
 from vllm.v1.worker.workspace import init_workspace_manager
+from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.worker.worker import NPUWorker
 
 from afd_plugin.compat.npu import (
@@ -21,7 +24,11 @@ from afd_plugin.compat.npu import (
 )
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
 from afd_plugin.v1.worker.npu.ffn_model_runner import AFDNPUFFNModelRunner
-from afd_plugin.validation import NPU_FFN_WORKER_FQCN, assert_compatible_afd_stack
+from afd_plugin.validation import (
+    NPU_FFN_WORKER_FQCN,
+    assert_compatible_afd_stack,
+    validate_npu_model_runner_v2_config,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -49,6 +56,7 @@ class AFDNPUFFNWorker(NPUWorker):
         self._ffn_thread: threading.Thread | None = None
         self._ffn_shutdown_event: threading.Event | None = None
         self._ffn_loop_error: BaseException | None = None
+        self._cpu_binding_attempted = False
 
     def init_device(self) -> None:
         assert_compatible_afd_stack(
@@ -60,7 +68,11 @@ class AFDNPUFFNWorker(NPUWorker):
         fail_if_unsupported_npu_afd_features(self.vllm_config)
         fix_all2all_backend_for_afd(self.vllm_config)
         if self.use_v2_model_runner:
-            raise RuntimeError("AFD NPU FFN supports only vllm-ascend MRv1")
+            validate_npu_model_runner_v2_config(
+                self.vllm_config,
+                expected_role="ffn",
+                device_type="npu",
+            )
 
         self.device = self._init_device()
         init_workspace_manager(
@@ -104,6 +116,7 @@ class AFDNPUFFNWorker(NPUWorker):
         if not connector.is_initialized:
             self.model_runner.initialize_afd_connector()
 
+        self._bind_cpus_once()
         self._ffn_shutdown_event = threading.Event()
         self._ffn_loop_error = None
 
@@ -128,6 +141,26 @@ class AFDNPUFFNWorker(NPUWorker):
         )
         self._ffn_thread.start()
 
+    def _bind_cpus_once(self) -> None:
+        if self._cpu_binding_attempted:
+            return
+        self._cpu_binding_attempted = True
+
+        if not get_ascend_config().enable_cpu_binding:
+            return
+
+        try:
+            physical_npu_id = current_platform.device_id_to_physical_device_id(
+                self.local_rank
+            )
+            bind_cpus(self.local_rank, npu_id=physical_npu_id)
+        except Exception as exc:
+            logger.warning(
+                "Bind cpus failed in rank%s: %s Skip binding cpu.",
+                self.local_rank,
+                exc,
+            )
+
     def _run_ffn_server_loop(self) -> None:
         event = self._ffn_shutdown_event
         if event is None:
@@ -144,11 +177,15 @@ class AFDNPUFFNWorker(NPUWorker):
             dp_metadata_list = payload.dp_metadata_list
             is_attn_graph_capturing = payload.is_graph_capturing
             is_warmup = payload.is_warmup
+            is_profile = payload.is_profile
+            is_graph_replaying = payload.is_graph_replaying
 
             self.model_runner.execute_ffn_step(
                 dp_metadata_list=dp_metadata_list,
                 is_graph_capturing=is_attn_graph_capturing,
                 is_warmup=is_warmup,
+                is_profile=is_profile,
+                is_graph_replaying=is_graph_replaying,
             )
             torch.npu.synchronize()
 
