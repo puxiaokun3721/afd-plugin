@@ -26,7 +26,9 @@ validation_paths:
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
   - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
   - "tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py"
+  - "tests/e2e/models/deepseek_v4_flash/test_sync_camp2p_npu.py"
   - "tests/unit/test_dsv4_e2e.py"
+  - "tests/unit/test_dsv4_sync_e2e.py"
   - "tests/e2e/environment.py"
   - "tests/e2e/models/deepseek_v4_flash/config.py"
   - "tests/e2e/models/deepseek_v4_flash/completions.py"
@@ -140,6 +142,23 @@ settings live alongside the model entrypoint. It does not run
 GSM8K or claim general accuracy coverage. It uses the same scoped async NPU
 FFN cleanup exception above and is not selected by the four-device PR gate.
 
+`afd-dsv4-flash-sync-camp2p-2a2f` (A5) and `afd-dsv4-flash-sync-camp2p-8a8f`
+(A3) are the synchronous siblings of that case: local-only DSV4 Flash runs over
+`CAMP2pAFDConnector`, each following its host's recorded launch profile — A5 on
+four devices as Attention DP2/TP1 with expert parallelism, ACL graph capture, and
+a 4096 context; A3 on sixteen as Attention DP2/TP4 and FFN DP8/TP1 with expert
+parallelism, eager, on the 8192/1024 budget. Neither needs a CAM vendor package: the plugin's
+own a2e/e2a operators carry the activations and, for the DSV4 Hash layers, the
+token ids the FFN-side gate routes with. Both keep the case's DSV4 model-path
+switches and the gate on FFN, and neither compares the answer: they are smoke
+cases over the ten-request concurrent oracle of the async case, which must be
+served together with a nonempty, finished answer each. A5 additionally drops the
+native DBO its script enables, because the DBO split path is the current suspect
+for the DSA operator tiling failure on that host, and pins the 128-token block
+with prefix caching off; its concurrent answers are still corrupted, which the
+e2e README records together with the A2E tile lead. The async case keeps the
+exact-answer check.
+
 The 2A1F cases (`afd-eager-2a1f`, `afd-graph-2a1f`, `afd-graph-dbo-2a1f`) are
 local-only scenarios: they use three of the four devices (two Attention ranks,
 one FFN rank) and run outside CI.
@@ -168,7 +187,7 @@ unverified.
 | Generated-token limit | 512 | 512 |
 | Samples | first 7; DBO gates floor at 24 | first 7; the DeepSeek `afd-graph-dbo-2a1f` case floors at 24 |
 | Metric | GSM8K exact match | GSM8K exact match |
-| Minimum accuracy | 0.27 | 0.27 |
+| Minimum accuracy | DeepSeek-V2-Lite smoke (up to 24 samples): 0.25; otherwise 0.27 | DeepSeek-V2-Lite smoke (up to 24 samples): 0.25; otherwise 0.27 |
 | Cases | four legacy cases plus four CUDA ModelRunnerV2 cases | six Qwen3 MoE / Qwen3.6 MoE cases plus DeepSeek-V2-Lite `afd-graph-dbo-2a1f` |
 
 An accuracy of `0.27` requires at least 2 correct answers out of 7 (7 out

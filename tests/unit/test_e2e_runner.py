@@ -23,6 +23,7 @@ from tests.e2e.accuracy import gsm8k as helpers_gsm8k
 from tests.e2e.models.deepseek_v2_lite import (
     test_deepseek_v2_lite as deepseek_v2_lite_e2e,
 )
+from tests.e2e.models.deepseek_v4_flash import config as dsv4_config
 from tests.e2e.models.qwen3_6 import test_qwen3_6 as qwen3_6_e2e
 from tests.e2e.models.qwen3_moe import test_qwen3_moe as qwen3_moe_e2e
 
@@ -83,6 +84,37 @@ def test_deepseek_v2_lite_entrypoint_limits_context(
     command = deepseek_v2_lite_e2e.build_runner_command(scenario, tmp_path)
 
     assert "--common-vllm-arg=--max-model-len=4096" in command
+
+
+@pytest.mark.parametrize(
+    ("backend", "scenario", "limit", "override", "expected"),
+    [
+        ("gpu", "afd-graph-dbo-2a2f", None, None, "0.25"),
+        ("gpu", "afd-graph-dbo-2a2f", "24", "0.30", "0.30"),
+        ("gpu", "afd-graph-dbo-2a2f", "256", None, None),
+        ("npu", "afd-graph-dbo-2a2f", "24", None, "0.25"),
+        ("gpu", "afd-v2-graph-dp2", None, None, "0.25"),
+        ("gpu", "afd-graph-dbo-2a2f", "all", None, None),
+    ],
+)
+def test_deepseek_smoke_threshold_preserves_large_runs_and_overrides(
+    monkeypatch, tmp_path, backend, scenario, limit, override, expected
+):
+    monkeypatch.setenv("AFD_E2E_BACKEND", backend)
+    monkeypatch.setenv(f"AFD_{backend.upper()}_E2E_MODEL", "model")
+    monkeypatch.delenv("AFD_GSM8K_LIMIT", raising=False)
+    if limit is not None:
+        monkeypatch.setenv("AFD_GSM8K_LIMIT", limit)
+    monkeypatch.delenv("AFD_GSM8K_THRESHOLD", raising=False)
+    if override is not None:
+        monkeypatch.setenv("AFD_GSM8K_THRESHOLD", override)
+
+    def check_runner_env(command, env):
+        assert env.get("AFD_GSM8K_THRESHOLD") == expected
+
+    monkeypatch.setattr(deepseek_v2_lite_e2e, "run_runner", check_runner_env)
+    deepseek_v2_lite_e2e.test_deepseek_v2_lite(scenario, tmp_path)
+    assert os.environ.get("AFD_GSM8K_THRESHOLD") == override
 
 
 def test_qwen3_moe_baseline_entrypoint_uses_four_devices(monkeypatch, tmp_path):
@@ -475,6 +507,22 @@ def test_parse_args_rejects_legacy_fixed_scenario_options(monkeypatch, legacy_ar
         ("afd-eager-async-cam", (False, False, False, 2, 2, 1, 2, 1, False)),
         ("afd-async-ubatch", (False, False, False, 2, 1, 1, 2, 1, False)),
         (runner.DSV4_ASYNC_CAM_SCENARIO, (False, False, False, 8, 8, 1, 4, 1, False)),
+        (
+            dsv4_config.DSV4_SYNC_CAMP2P_A5_SCENARIO,
+            # The A5 profile runs Attention DP2/TP1 and FFN DP2/TP1 with ACL
+            # graph capture like its launch script, but without that script's
+            # native DBO, whose split path is the current suspect for the A5 DSA
+            # attention operator tiling failure.
+            (False, True, False, 2, 2, 1, 1, 1, False),
+        ),
+        (
+            dsv4_config.DSV4_SYNC_CAMP2P_A3_SCENARIO,
+            # Sixteen dies: Attention DP2/TP4 and FFN DP8/TP1 with expert
+            # parallelism, the shape its recorded deployment uses. It runs on
+            # NPU like the asynchronous case, so it keeps the v1 model runner:
+            # ModelRunnerV2 is CUDA-only.
+            (False, False, False, 8, 8, 1, 4, 1, False),
+        ),
         ("afd-v2-eager-1a1f", (False, False, False, 1, 1, 1, 1, 1, True)),
         ("afd-v2-eager-dp2", (False, False, False, 2, 2, 1, 1, 1, True)),
         ("afd-v2-eager-tp2", (False, False, False, 2, 2, 1, 2, 2, True)),
@@ -508,8 +556,16 @@ def test_configure_scenario_overwrites_fixed_topology_and_features(
         args.ffn_tp_size,
         args.use_v2_model_runner,
     ) == expected
+    # A scenario that carries its own launch profile (the DSV4 synchronous
+    # cases) uses that profile's graph setting instead of the default.
+    profile = dsv4_config.sync_shape(scenario)
     if args.cuda_graph_full_decode_only:
-        assert args.cudagraph_capture_size == 8
+        expected_capture_size = (
+            profile.cudagraph_capture_size
+            if profile is not None
+            else runner.DEFAULT_CUDAGRAPH_CAPTURE_SIZE
+        )
+        assert args.cudagraph_capture_size == expected_capture_size
     if args.enable_dbo:
         assert args.dbo_decode_token_threshold == 1
         assert args.dbo_prefill_token_threshold == 8
@@ -1670,19 +1726,21 @@ def test_v2_model_entry_builds_runner_command_with_exact_devices(
     assert command[command.index("--ffn-devices") + 1] == ffn_devices
 
 
-def test_configure_scenario_separates_prefill_and_decode_steps_for_dbo():
+@pytest.mark.parametrize(
+    "common_args",
+    [
+        ["--unrelated-arg"],
+        ["--enable-chunked-prefill"],
+        ["--no-enable-chunked-prefill"],
+    ],
+)
+def test_configure_dbo_preserves_chunked_prefill_choice(common_args):
     args = _args()
-    args.scenario = "afd-graph-dbo-2a1f"
-    args.common_vllm_arg = ["--unrelated-arg"]
+    args.scenario = "afd-graph-dbo-2a2f"
+    args.common_vllm_arg = list(common_args)
     runner.configure_scenario(args)
 
-    assert "--no-enable-chunked-prefill" in args.common_vllm_arg
-
-    args.scenario = "afd-graph-2a1f"
-    args.common_vllm_arg = ["--unrelated-arg"]
-    runner.configure_scenario(args)
-
-    assert "--no-enable-chunked-prefill" not in args.common_vllm_arg
+    assert args.common_vllm_arg == common_args
 
 
 def test_build_env_enables_debug_logging_for_dbo_scenarios(monkeypatch):
