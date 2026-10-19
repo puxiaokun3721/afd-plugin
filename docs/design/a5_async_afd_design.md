@@ -1,4 +1,6 @@
-# A5 / Ascend 950 异步 AFD 统一设计 v3（含 DeepEP-Ascend 小算子后端）
+# A5 / Ascend 950 异步 AFD 统一设计（含 DeepEP-Ascend 小算子后端）
+
+当前文档入口与实现状态见[设计索引](README.md)。本文定义目标协议，源码存在不等于平台验收通过。
 
 日期：2026-10-16。状态：独立复核后的设计基线；平台准入尚未通过。本文按场景、现有方案、技术选型、总体架构和详细设计展开。设计决定不代表 A5 实现、编译、图模式或性能验收已经完成。
 
@@ -1064,7 +1066,7 @@ mega_execute(Context, Active, ExecutionState, LayerTable, Workspace)
 
 **设计决定：DeepEP-AFD 与 MoeDistribute V2 A5 MTE 对 AFD 框架提供同一套五算子接口和完成语义。** 初版先实现 DeepEP-AFD，MTE 后续实现同一契约；这不是两个上游接口天然兼容，也不表示当前已具备可互换的实现。
 
-对外算子统一命名为 `dispatchSend`、`dispatchRecv`、`combineSend`、`combineRecv`、`ffnScheduler`。上方语义 ABI 表示职责分解，不要求逐项暴露为框架算子：其中调度职责从原逻辑 `dispatch_recv` 拆到 `ffnScheduler`，数据接收/展开由 `dispatchRecv` 承担，`ffn_commit` 作为 `combineSend` 的末尾阶段执行。框架不再单独调用第六个 commit 算子。具体参数、shape、dtype 和上游映射以独立的[五算子详细设计](a5_async_afd_deepep_operator_design_v1.md)为准。
+对外算子统一命名为 `dispatchSend`、`dispatchRecv`、`combineSend`、`combineRecv`、`ffnScheduler`。上方语义 ABI 表示职责分解，不要求逐项暴露为框架算子：其中调度职责从原逻辑 `dispatch_recv` 拆到 `ffnScheduler`，数据接收/展开由 `dispatchRecv` 承担，`ffn_commit` 作为 `combineSend` 的末尾阶段执行。框架不再单独调用第六个 commit 算子。具体参数、shape、dtype 和上游映射以独立的[五算子详细设计](a5_async_afd_deepep_operator_design.md)为准。
 
 | 公共算子 | 两种小算子实现必须保持一致的职责与完成含义 |
 | --- | --- |
@@ -1397,18 +1399,11 @@ G1–G6及启用DeepEP时的G1-D/G2-D是必须验证的具体平台/实现缺口
 
 每 lane/F 可省 32B 控制预留和每轮一次 32B 消息；payload、计算 workspace 不变。归并可能因等待最后输入引用结束而略晚，并把两个通道生命周期耦合，取消未来独立早 ACK 的自由度。**首版仍保留两通知**，在完整协议测试通过、控制流量占比可测后再以新 Context 模式启用；禁止运行中混合两套协议。
 
-## 附录 A. 输入和源码基线
+## 附录 A. 设计参考源码基线
 
-四份输入目录均为 `D:/Code/mine/vllm-afd-plugin/docs/design/`，本版引用行号对应该快照：
+以下为设计分析时的固定源码快照，不是当前开发分支 HEAD。历史审查材料见本地归档或 Git 历史。
 
-| 文件 | SHA-256 |
-| --- | --- |
-| a5_async_afd_unified_megamoe_distributed_design.md | 5f8ff0b610187458334c2b227ce3b4150900777b028e31cb1a3000f742c332d3 |
-| a5_async_afd_architecture_review_2026-10-16.md | 3c95cd7194f66dbb2d0f7bf704486d1a6d2e8fdf56f10648d8e5ff6dda05353e |
-| a5_async_afd_unified_megamoe_distributed_design_reviewed_v2.md | 42a3c05b064b4ca405fec630304d9594ad5e0b5acb0590a99836bfbd53073fe5 |
-| a5_async_afd_v2_author_recheck_2026-10-16.md | a3dcdd8690f85a077219390f12ed8f28d7c496f0047472cfd5547ffe140d0360 |
-
-| 仓库绝对路径 | 实际 HEAD |
+| 仓库绝对路径 | 设计参考 commit |
 | --- | --- |
 | D:/Code/mine/vllm-afd-plugin | 7cb0aebf4b036ca6466bf01153ec89282a9eff03 |
 | D:/Code/refs/ops-transformer | 8d46ac50deabb544f59f56f5b82a995159907c03 |
@@ -1416,112 +1411,91 @@ G1–G6及启用DeepEP时的G1-D/G2-D是必须验证的具体平台/实现缺口
 | D:/Code/refs/DeepEP-Ascend | 3b25377d04b24fc6154698ded78a2bcb2c59afff |
 | D:/Code/refs/DeepGEMM-Ascend | 8491bbb4b8c02a094a2318965f50c70438a3e73c |
 
-与独立审查/v2 的本地基线一致；原稿引用的历史 PR408 对象 `08b4fc4…` 在当前本地对象中不可复核，不能用当前 HEAD 代替其历史 diff。AFD 工作树已有 AGENTS.md、docs/npu/CAM_ASYNC_ROUTED_OPS.md 的用户变更，本版不修改。源码版本还需与实际安装 CANN、自定义算子包、torch_npu 和 vLLM-Ascend 版本绑定后才能做部署结论。
+源码版本还需与实际安装 CANN、自定义算子包、torch_npu 和 vLLM-Ascend 版本绑定后才能做部署结论。
 
 ## 附录 B. 源码证据索引
 
-以下是代码事实定位；范围用起始行链接，正文描述同时给出必要后续行。对应目标改造均未在本次写入代码。
+以下是代码事实定位；范围用起始行链接，正文描述同时给出必要后续行。这些引用用于说明参考实现；当前 AFD 开发实现见设计索引链接的代码仓。
 
 **B1 CAMAsync 接收与调度**
 
-- [dispatch_recv.h:500](D:/Code/mine/vllm-afd-plugin/csrc/npu/ascend_kernels/afd_async_dispatch_recv/op_kernel/afd_async_dispatch_recv.h:500)：至564为DP轮询，526零token不就绪；255聚合TP计数，287分轮预算，343续跑；121/419的uint16不能直接用于任意大token索引。
-- [async_cam.py:523](D:/Code/mine/vllm-afd-plugin/afd_plugin/connectors/npu/async_cam.py:523)：发送入口；629接收、692 FFN接收、766 FFN发送。现有调用不等于目标协议已实现。
+- [dispatch_recv.h:500](../../csrc/npu/ascend_kernels/afd_async_dispatch_recv/op_kernel/afd_async_dispatch_recv.h#L500)：至564为DP轮询，526零token不就绪；255聚合TP计数，287分轮预算，343续跑；121/419的uint16不能直接用于任意大token索引。
+- [async_cam.py:523](../../afd_plugin/connectors/npu/async_cam.py#L523)：发送入口；629接收、692 FFN接收、766 FFN发送。现有调用不等于目标协议已实现。
 
 **B2 框架时序**
 
-- [deepseek_v2_async_cam_forward.py:447](D:/Code/mine/vllm-afd-plugin/afd_plugin/model_executor/models/npu/deepseek_v2_async_cam_forward.py:447)：451 recv mb0、452 send mb1；末尾478–486同类顺序。
-- [ffn_model_runner.py:373](D:/Code/mine/vllm-afd-plugin/afd_plugin/v1/worker/npu/ffn_model_runner.py:373)：recv/executor/send串行；[ffn_worker.py:170](D:/Code/mine/vllm-afd-plugin/afd_plugin/v1/worker/npu/ffn_worker.py:170)逐step同步。
+- [deepseek_v2_async_cam_forward.py:447](../../afd_plugin/model_executor/models/npu/deepseek_v2_async_cam_forward.py#L447)：451 recv mb0、452 send mb1；末尾478–486同类顺序。
+- [ffn_model_runner.py:373](../../afd_plugin/v1/worker/npu/ffn_model_runner.py#L373)：recv/executor/send串行；[ffn_worker.py:170](../../afd_plugin/v1/worker/npu/ffn_worker.py#L170)逐step同步。
 
 **B3 Layered 和模式**
 
-- [async_cam_w4a8.py:149](D:/Code/mine/vllm-afd-plugin/afd_plugin/model_executor/npu/async_cam_w4a8.py:149)：至179使用层索引调用两GMM；并非所有节点已有Active gate。
-- [layered_tensor_addr.h:43](D:/Code/mine/vllm-afd-plugin/csrc/npu/ascend_kernels/utils/op_kernel/layered/layered_tensor_addr.h:43)：48–49非法层回落0；[layered GMM:45](D:/Code/mine/vllm-afd-plugin/csrc/npu/ascend_kernels/grouped_matmul_swiglu_quant_v2_layered/op_kernel/grouped_matmul_swiglu_quant_v2_layered.cpp:45)入口读取层号。
-- [ffn_model_runner.py:124](D:/Code/mine/vllm-afd-plugin/afd_plugin/v1/worker/npu/ffn_model_runner.py:124)、[feature_validation.py:186](D:/Code/mine/vllm-afd-plugin/afd_plugin/compat/npu/feature_validation.py:186)：现有layered芯片/eager边界与功能检查。
+- [async_cam_w4a8.py:149](../../afd_plugin/model_executor/npu/async_cam_w4a8.py#L149)：至179使用层索引调用两GMM；并非所有节点已有Active gate。
+- [layered_tensor_addr.h:43](../../csrc/npu/ascend_kernels/utils/op_kernel/layered/layered_tensor_addr.h#L43)：48–49非法层回落0；[layered GMM:45](../../csrc/npu/ascend_kernels/grouped_matmul_swiglu_quant_v2_layered/op_kernel/grouped_matmul_swiglu_quant_v2_layered.cpp#L45)入口读取层号。
+- [ffn_model_runner.py:124](../../afd_plugin/v1/worker/npu/ffn_model_runner.py#L124)、[feature_validation.py:186](../../afd_plugin/compat/npu/feature_validation.py#L186)：现有layered芯片/eager边界与功能检查。
 
 **B4 AIV 配额**
 
-- [dispatch_send.cpp:198](D:/Code/mine/vllm-afd-plugin/csrc/npu/ascend_kernels/afd_async_dispatch_send/op_host/afd_async_dispatch_send.cpp:198)、[combine_recv.cpp:185](D:/Code/mine/vllm-afd-plugin/csrc/npu/ascend_kernels/afd_async_combine_recv/op_host/afd_async_combine_recv.cpp:185)：全AIV配置不能证明等待核并发进度。
+- [dispatch_send.cpp:198](../../csrc/npu/ascend_kernels/afd_async_dispatch_send/op_host/afd_async_dispatch_send.cpp#L198)、[combine_recv.cpp:185](../../csrc/npu/ascend_kernels/afd_async_combine_recv/op_host/afd_async_combine_recv.cpp#L185)：全AIV配置不能证明等待核并发进度。
 
 **B5 MegaMoE arch35**
 
-- [mega_moe_wave_a8w8.h:630](D:/Code/refs/ops-transformer/mc2/mega_moe/op_kernel/arch35/mega_moe_wave_a8w8.h:630)：wave入口；684–727交错GMM和combine，700附近要求角色相同调用序。
-- [mega_moe_gmm_epilogue_sync.h:34](D:/Code/refs/ops-transformer/mc2/mega_moe/op_kernel/arch35/common/mega_moe_gmm_epilogue_sync.h:34)：GM等待；59–61跨核flag等待无取消协议。
-- [mega_moe_peermem.h:40](D:/Code/refs/ops-transformer/mc2/mega_moe/op_kernel/arch35/common/mega_moe_peermem.h:40)：固定同步区；136量化record；207–242路由和总容量。
-- [mega_moe_workspace.h:165](D:/Code/refs/ops-transformer/mc2/mega_moe/op_kernel/arch35/common/mega_moe_workspace.h:165)：dispatch；205activation、220metadata、331GMM2、337rowDesc。
-- [mega_moe_tiling.cpp:1658](D:/Code/refs/ops-transformer/mc2/mega_moe/op_host/op_tiling/arch35/mega_moe_tiling.cpp:1658)：额外预留与平台workspace；[mega_moe_arch35.h:295](D:/Code/refs/ops-transformer/mc2/mega_moe/op_kernel/arch35/mega_moe_arch35.h:295)源维度假设。
+- [mega_moe_wave_a8w8.h:630](https://gitcode.com/cann/ops-transformer/blob/8d46ac50deabb544f59f56f5b82a995159907c03/mc2/mega_moe/op_kernel/arch35/mega_moe_wave_a8w8.h#L630)：wave入口；684–727交错GMM和combine，700附近要求角色相同调用序。
+- [mega_moe_gmm_epilogue_sync.h:34](https://gitcode.com/cann/ops-transformer/blob/8d46ac50deabb544f59f56f5b82a995159907c03/mc2/mega_moe/op_kernel/arch35/common/mega_moe_gmm_epilogue_sync.h#L34)：GM等待；59–61跨核flag等待无取消协议。
+- [mega_moe_peermem.h:40](https://gitcode.com/cann/ops-transformer/blob/8d46ac50deabb544f59f56f5b82a995159907c03/mc2/mega_moe/op_kernel/arch35/common/mega_moe_peermem.h#L40)：固定同步区；136量化record；207–242路由和总容量。
+- [mega_moe_workspace.h:165](https://gitcode.com/cann/ops-transformer/blob/8d46ac50deabb544f59f56f5b82a995159907c03/mc2/mega_moe/op_kernel/arch35/common/mega_moe_workspace.h#L165)：dispatch；205activation、220metadata、331GMM2、337rowDesc。
+- [mega_moe_tiling.cpp:1658](https://gitcode.com/cann/ops-transformer/blob/8d46ac50deabb544f59f56f5b82a995159907c03/mc2/mega_moe/op_host/op_tiling/arch35/mega_moe_tiling.cpp#L1658)：额外预留与平台workspace；[mega_moe_arch35.h:295](https://gitcode.com/cann/ops-transformer/blob/8d46ac50deabb544f59f56f5b82a995159907c03/mc2/mega_moe/op_kernel/arch35/mega_moe_arch35.h#L295)源维度假设。
 
 **B6 V2 A5 MTE 与 MoeEP**
 
-- [V2 selector:1253](D:/Code/refs/ops-transformer/mc2/moe_distribute_dispatch_v2/op_host/op_tiling/arch35/moe_distribute_dispatch_v2_tiling_arch35.cpp:1253)：默认comm_alg选择；[V2 tiling:62](D:/Code/refs/ops-transformer/mc2/moe_distribute_dispatch_v2/op_host/op_tiling/moe_distribute_dispatch_v2_tiling.cpp:62)及950的BS上限。
-- [dispatch kernel:513](D:/Code/refs/ops-transformer/mc2/moe_distribute_dispatch_v2/op_kernel/moe_distribute_dispatch_v2.h:513)：完整路由UB；809回扫前缀；822固定专家跨度；1062状态搬运不能证明整条目标发布协议。
-- [A5 combine:1461](D:/Code/refs/ops-transformer/mc2/moe_distribute_combine_v2/op_kernel/arch35/moe_distribute_combine_v2_a5_mte.h:1461)：mask后才等待；1695全inactive早退；1063–1076清理data-as-flag。
-- [MoeEP dispatch:1191](D:/Code/refs/ops-transformer/mc2/moe_ep_dispatch/op_kernel/moe_ep_dispatch.h:1191)：Hcomm写/提交路径；[MoeEP layout:82](D:/Code/refs/ops-transformer/mc2/common/op_host/op_tiling/moe_ep_window_layout.cpp:82)stride，100–106stash和总窗口。
+- [V2 selector:1253](https://gitcode.com/cann/ops-transformer/blob/8d46ac50deabb544f59f56f5b82a995159907c03/mc2/moe_distribute_dispatch_v2/op_host/op_tiling/arch35/moe_distribute_dispatch_v2_tiling_arch35.cpp#L1253)：默认comm_alg选择；[V2 tiling:62](https://gitcode.com/cann/ops-transformer/blob/8d46ac50deabb544f59f56f5b82a995159907c03/mc2/moe_distribute_dispatch_v2/op_host/op_tiling/moe_distribute_dispatch_v2_tiling.cpp#L62)及950的BS上限。
+- [dispatch kernel:513](https://gitcode.com/cann/ops-transformer/blob/8d46ac50deabb544f59f56f5b82a995159907c03/mc2/moe_distribute_dispatch_v2/op_kernel/moe_distribute_dispatch_v2.h#L513)：完整路由UB；809回扫前缀；822固定专家跨度；1062状态搬运不能证明整条目标发布协议。
+- [A5 combine:1461](https://gitcode.com/cann/ops-transformer/blob/8d46ac50deabb544f59f56f5b82a995159907c03/mc2/moe_distribute_combine_v2/op_kernel/arch35/moe_distribute_combine_v2_a5_mte.h#L1461)：mask后才等待；1695全inactive早退；1063–1076清理data-as-flag。
+- [MoeEP dispatch:1191](https://gitcode.com/cann/ops-transformer/blob/8d46ac50deabb544f59f56f5b82a995159907c03/mc2/moe_ep_dispatch/op_kernel/moe_ep_dispatch.h#L1191)：Hcomm写/提交路径；[MoeEP layout:82](https://gitcode.com/cann/ops-transformer/blob/8d46ac50deabb544f59f56f5b82a995159907c03/mc2/common/op_host/op_tiling/moe_ep_window_layout.cpp#L82)stride，100–106stash和总窗口。
 
 **B7 vLLM-Ascend**
 
-- [token_dispatcher.py:130](D:/Code/refs/vllm_ascend/vllm_ascend/ops/fused_moe/token_dispatcher.py:130)：容量参数；232 V2调用。
-- [moe_comm_method.py:375](D:/Code/refs/vllm_ascend/vllm_ascend/ops/fused_moe/moe_comm_method.py:375)：至449 Mega容量；497–500 A5 mask；519–534逐层参数。
-- [moe_utils.py:144](D:/Code/refs/vllm_ascend/vllm_ascend/ops/fused_moe/moe_utils.py:144)：算子动态选择和capture前初始化；实际包版本需另核。
+- [token_dispatcher.py:130](https://github.com/vllm-project/vllm-ascend/blob/be0b61da22778b043eb2369b5f922b2a39ddc46d/vllm_ascend/ops/fused_moe/token_dispatcher.py#L130)：容量参数；232 V2调用。
+- [moe_comm_method.py:375](https://github.com/vllm-project/vllm-ascend/blob/be0b61da22778b043eb2369b5f922b2a39ddc46d/vllm_ascend/ops/fused_moe/moe_comm_method.py#L375)：至449 Mega容量；497–500 A5 mask；519–534逐层参数。
+- [moe_utils.py:144](https://github.com/vllm-project/vllm-ascend/blob/be0b61da22778b043eb2369b5f922b2a39ddc46d/vllm_ascend/ops/fused_moe/moe_utils.py#L144)：算子动态选择和capture前初始化；实际包版本需另核。
 
 **B8 其他参考**
 
-- [DeepEP dispatch.hpp:174](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/impls/ep/dispatch.hpp:174)：histogram及181–186rank去重；[buffers/ep.hpp:285](D:/Code/refs/DeepEP-Ascend/csrc/buffers/ep.hpp:285)异步通信张量生命周期。
-- [DeepEP README:28](D:/Code/refs/DeepEP-Ascend/README.md:28)：UBMEM/URMA依赖及后续验证环境/图范围。
-- [DeepGEMM comm/mega_moe.hpp:66](D:/Code/refs/DeepGEMM-Ascend/deep_gemm/include/deep_gemm/comm/mega_moe.hpp:66)：epoch/双signal/atomic rank barrier；不能作为无F barrier的现成实现。
+- [DeepEP dispatch.hpp:174](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/impls/ep/dispatch.hpp#L174)：histogram及181–186rank去重；[buffers/ep.hpp:285](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/csrc/buffers/ep.hpp#L285)异步通信张量生命周期。
+- [DeepEP README:28](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/README.md#L28)：UBMEM/URMA依赖及后续验证环境/图范围。
+- [DeepGEMM comm/mega_moe.hpp:66](https://github.com/deepseek-ai/DeepGEMM-Ascend/blob/8491bbb4b8c02a094a2318965f50c70438a3e73c/deep_gemm/include/deep_gemm/comm/mega_moe.hpp#L66)：epoch/双signal/atomic rank barrier；不能作为无F barrier的现成实现。
 
 **B9 DeepEP host、collective与异步生命周期**
 
-- [ep.hpp:138](D:/Code/refs/DeepEP-Ascend/csrc/buffers/ep.hpp:138)：专家按context num_ranks分配；269同一num_ranks进入kernel；285捕获URMA源生命周期；299–319 CPU counts或最坏展开容量；322以后动态输出分配；395以后deferred epilogue返回。
-- [dispatch.hpp:470](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/impls/ep/dispatch.hpp:470)：等待所有rank专家计数；651进入barrier；不能凭defer取消全组依赖。
-- [dispatch_copy_epilogue.hpp:179](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/impls/ep/dispatch_copy_epilogue.hpp:179)：kDoBarrier与200处调用；258原按rank分区BufferLayout。
+- [ep.hpp:138](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/csrc/buffers/ep.hpp#L138)：专家按context num_ranks分配；269同一num_ranks进入kernel；285捕获URMA源生命周期；299–319 CPU counts或最坏展开容量；322以后动态输出分配；395以后deferred epilogue返回。
+- [dispatch.hpp:470](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/impls/ep/dispatch.hpp#L470)：等待所有rank专家计数；651进入barrier；不能凭defer取消全组依赖。
+- [dispatch_copy_epilogue.hpp:179](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/impls/ep/dispatch_copy_epilogue.hpp#L179)：kDoBarrier与200处调用；258原按rank分区BufferLayout。
 
 **B10 DeepEP URMA完成与barrier职责**
 
-- [barrier.hpp:115](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/comm/barrier.hpp:115)：barrier入口；120开始MTE/核同步，131开始jetty drain，156以后remote_signal与全rank等待。
-- [handle.hpp:239](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/comm/handle.hpp:239)：强序/fence/CQE标志；398 CQ轮询；430错误检查；452 drain按提交完成计数等待。源代码不是跨通路可见性已实测的证明。
-- [combine.hpp:342](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/impls/ep/combine.hpp:342)：追加请求CQE的strong-order NOP；仅移除barrier会影响原完成路径。
+- [barrier.hpp:115](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/comm/barrier.hpp#L115)：barrier入口；120开始MTE/核同步，131开始jetty drain，156以后remote_signal与全rank等待。
+- [handle.hpp:239](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/comm/handle.hpp#L239)：强序/fence/CQE标志；398 CQ轮询；430错误检查；452 drain按提交完成计数等待。源代码不是跨通路可见性已实测的证明。
+- [combine.hpp:342](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/impls/ep/combine.hpp#L342)：追加请求CQE的strong-order NOP；仅移除barrier会影响原完成路径。
 
 **B11 DeepEP UB与record/容量**
 
-- [dispatch.hpp:25](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/impls/ep/dispatch.hpp:25)：UBLayout数组；58–73 metadata/hidden stages；83–85每核token×K维度；174–186去重与histogram。
-- [dispatch_copy_epilogue.hpp:217](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/impls/ep/dispatch_copy_epilogue.hpp:217)：固定histogram stage与metadata/MTE UB预算；244以后R≤512、histogram/事件数/UB静态检查。
-- [token.hpp:16](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/layout/ep/token.hpp:16)：原生metadata、对齐和TokenLayout字段；[ep.hpp:560](D:/Code/refs/DeepEP-Ascend/csrc/buffers/ep.hpp:560)buffer公式，582–609 size hint取dispatch/combine最大并对齐。
+- [dispatch.hpp:25](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/impls/ep/dispatch.hpp#L25)：UBLayout数组；58–73 metadata/hidden stages；83–85每核token×K维度；174–186去重与histogram。
+- [dispatch_copy_epilogue.hpp:217](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/impls/ep/dispatch_copy_epilogue.hpp#L217)：固定histogram stage与metadata/MTE UB预算；244以后R≤512、histogram/事件数/UB静态检查。
+- [token.hpp:16](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/layout/ep/token.hpp#L16)：原生metadata、对齐和TokenLayout字段；[ep.hpp:560](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/csrc/buffers/ep.hpp#L560)buffer公式，582–609 size hint取dispatch/combine最大并对齐。
 
 **B12 DeepEP combine数值与地址**
 
-- [combine.hpp:301](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/impls/ep/combine.hpp:301)：rank/source slot地址及多专家局部归并；不能直接等价于目标逐route返回。
-- [combine_reduce_epilogue.hpp:63](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/impls/ep/combine_reduce_epilogue.hpp:63)：原barrier；102开始seen_ranks及130–135 rank/subslot返回寻址。
+- [combine.hpp:301](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/impls/ep/combine.hpp#L301)：rank/source slot地址及多专家局部归并；不能直接等价于目标逐route返回。
+- [combine_reduce_epilogue.hpp:63](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/impls/ep/combine_reduce_epilogue.hpp#L63)：原barrier；102开始seen_ranks及130–135 rank/subslot返回寻址。
 
 **B13 DeepEP环境与原生测试**
 
-- [README.md:26](D:/Code/refs/DeepEP-Ascend/README.md:26)：依赖与验证栈；38以后HDK说明；84 graph不支持；252–285运行示例与多机启动约定。
-- [test_ep.py:553](D:/Code/refs/DeepEP-Ascend/tests/ep/test_ep.py:553)：CLI参数及脚本自行spawn；33 deferred epilogue测试入口；149区分CPU同步与最坏接收容量。
+- [README.md:26](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/README.md#L26)：依赖与验证栈；38以后HDK说明；84 graph不支持；252–285运行示例与多机启动约定。
+- [test_ep.py:553](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/tests/ep/test_ep.py#L553)：CLI参数及脚本自行spawn；33 deferred epilogue测试入口；149区分CPU同步与最坏接收容量。
 - [上游项目说明](https://github.com/deepseek-ai/DeepEP-Ascend)：在线README与本地基线需分别记录；本文新增设计结论仍以固定commit源码为依据。
-
-## 附录 C. 对原作者复核的逐项处置
-
-作者回复绝对路径：`D:/Code/mine/vllm-afd-plugin/docs/design/a5_async_afd_v2_author_recheck_2026-10-16.md`。
-
-| 作者位置 | 处置 | v3 落点与依据 |
-| --- | --- | --- |
-| L36–52 返回ABA、全F修复 | 接受 | §4.4完整闭合证明，含零route/参与变化/延迟；不恢复原稿稀疏Done |
-| L54–59 进度条件 | 调整适用范围 | §4.5.2证明先算后等也可无环；“未授权必须留Pending”仅适用于PRECHECK，A进度条件两者都必须满足 |
-| L61 全F慢成员代价 | 接受 | §3.4、§5.5明确槽级汇合，不称无等待 |
-| L65–69 物理Inbox及发布 | 接受并补全 | §4.2、§4.4固定地址+独立bit，ACK前引用结束；新增send独立规划returnBit与两项Ledger |
-| L78–93 授权与两策略 | 接受、撤回v2唯一预检限制 | §4.3、§4.5定义NONE/HELD/FINISHED，默认compute-ahead；同预算Mega提前量由原wave限制，见B5 |
-| L97–106 Decode发布与资源 | 接受 | §4.6展开M=2/3事件，补本地Epub/Erecv汇合Etxn；多轮recv提前运行仍受G3准入，依据B2/B4 |
-| L112–120 mask/record | 接受并锁定ABI | §4.2.2、§4.2.3给出ref编码、DISABLE单有效位、inactive写零；依据B6 |
-| L124–130 状态/Completion/gate/非法层 | 接受 | §4.3单Active串行提交，§6.1逐节点gate及分层退出；不再以层号回落或abort flag代替处理，依据B3/B5 |
-| L134–157 原目标与compute-ahead | 接受并精化后端边界 | §5.2保留原wave；不承诺Mega整片提前完成，无额外结果buffer；§5.5维持通信和workspace预算 |
-| L161–173 定稿与实机条件 | 接受 | 协议/接口已给出；§6.3具体列出仍阻断部署的硬件与实现验收 |
-| L177 合并Done/Consumed | 接受为后续候选 | §6.5.1给出两个消费者不会丢完成的证明；首版保留独立通知 |
-
-整体结论：原作者关于恢复单 workspace 先算后等、补齐授权续跑和图 gate 的意见成立；v2 的预检独占选择应撤回。经本版定义，交替位在全 F 逐轮闭合、物理槽严格复用及可靠完成语义下可以替代独立递增计数器，代价是保守输入释放和慢 F 槽级汇合。融合/小算子两条路径与三场景目标未减少；小算子优先验证DeepEP-AFD，保留MTE备选。可开始按本协议实施和验证，但 G1–G6 及启用DeepEP时的G1-D/G2-D未通过前不能宣称 A5 端到端或图模式已可部署。
-
 
 <a id="deepep-environment-check"></a>
 
-## 附录 D. DeepEP 原生 A5 环境测试手册
+## 附录 C. DeepEP 原生 A5 环境测试手册
 
 本节只要求验证上游原生DeepEP能否在目标环境运行，不要求同事实现本文AFD改造。测试结果用于D0准入；源目录和安装以测试服务器Linux路径为准，不能在本Windows工作区执行这些NPU命令。本次文档更新没有运行下列命令，也没有替同事认定环境通过。
 

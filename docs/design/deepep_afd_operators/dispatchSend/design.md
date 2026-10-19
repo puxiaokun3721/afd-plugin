@@ -172,6 +172,6 @@ metadata全轮暂存直到本轮最后drain，之后可复用；两个D槽的sen
 
 ## 8. 参考实现与DoD
 
-[原dispatch入口](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/impls/ep/dispatch.hpp:551)、[去重](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/common/simt.hpp:25)、[host launcher](D:/Code/refs/DeepEP-Ascend/csrc/kernels/ep/dispatch.hpp:20)、[SQ/CQ](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/comm/handle.hpp:358)。
+[原dispatch入口](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/impls/ep/dispatch.hpp#L551)、[去重](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/common/simt.hpp#L25)、[host launcher](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/csrc/kernels/ep/dispatch.hpp#L20)、[SQ/CQ](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/comm/handle.hpp#L358)。
 
 设计交付覆盖：完整签名、dtype、API阶段映射、tiling结构/公式、逐buffer UB与例算、GM生命周期、搬运不Cast的理由、实现/测试清单。未通过的事项是A5跨通路可见性、注册与核共存实测，不以文档完成替代平台准入。

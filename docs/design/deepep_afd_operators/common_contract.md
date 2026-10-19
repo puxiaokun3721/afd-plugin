@@ -1,6 +1,6 @@
 # DeepEP-AFD 算子公共接口、布局与原语契约
 
-本文件与四个通信算子的 design.md 合起来构成代码生成输入；ffnScheduler/design.md 本轮仅冻结接口。它们细化[五算子总设计](D:/Code/mine/vllm-afd-plugin/docs/design/a5_async_afd_deepep_operator_design_v1.md)，不修改总设计。实现目标是 DeepEP-Ascend 仓库，基线commit `3b25377d04b24fc6154698ded78a2bcb2c59afff`，不是另建一个无关Ascend算子工程。
+本文件与四个通信算子的 design.md 合起来构成代码生成输入；ffnScheduler/design.md 的范围为接口契约，当前开发实现状态见[设计入口](../README.md)。它们细化[五算子总设计](../a5_async_afd_deepep_operator_design.md)。实现目标是 DeepEP-Ascend 仓库，基线commit `3b25377d04b24fc6154698ded78a2bcb2c59afff`，不是另建一个无关Ascend算子工程。
 
 ## 1. 公共约定与类型
 

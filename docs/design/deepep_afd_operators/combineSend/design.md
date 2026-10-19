@@ -143,6 +143,6 @@ COMPUTE_AHEAD等待credit时x必须保留，单workspace不能绕过该Active；
 
 ## 8. 参考实现与DoD
 
-[combine入口](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/impls/ep/combine.hpp:162)、[元数据/WQE](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/impls/ep/combine.hpp:59)、[put/drain](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/comm/handle.hpp:358)、[launcher](D:/Code/refs/DeepEP-Ascend/csrc/kernels/ep/combine.hpp:18)。
+[combine入口](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/impls/ep/combine.hpp#L162)、[元数据/WQE](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/impls/ep/combine.hpp#L59)、[put/drain](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/comm/handle.hpp#L358)、[launcher](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/csrc/kernels/ep/combine.hpp#L18)。
 
 签名、dtype、API映射、两级tiling、完整UB例算、业务workspace、精度/生命周期及开发清单已列明。实机注册/完成/资源结果不能由设计稿代替。

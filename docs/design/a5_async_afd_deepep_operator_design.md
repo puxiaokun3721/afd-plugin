@@ -1,8 +1,8 @@
-# A5 异步 AFD：DeepEP-Ascend 五算子详细设计 v1
+# A5 异步 AFD：DeepEP-Ascend 五算子详细设计
 
-日期：2026-10-16。范围：`dispatchSend`、`dispatchRecv`、`combineSend`、`combineRecv`、`ffnScheduler`。本文是新增实现的接口与执行设计，不是已实现或已实机验证的 API。仅新增本文，不修改整体设计或源码。
+日期：2026-10-16。范围：`dispatchSend`、`dispatchRecv`、`combineSend`、`combineRecv`、`ffnScheduler`。本文定义接口与执行设计；五算子已有开发实现，当前实现范围与验证状态见[设计索引](README.md)，不能将设计目标视为已实机验证的 API。
 
-上位约束：[整体设计 v3](D:/Code/mine/vllm-afd-plugin/docs/design/a5_async_afd_unified_megamoe_distributed_design_reviewed_v3.md)。本版只实施 DeepEP-AFD 小算子路径；GMM1、activation/quant、GMM2 属于外部计算链，必须遵守本文 Active gate 和输出生命周期，但不重新设计其数值内核。MegaMoE/MTE 不在本次接口展开范围。
+上位约束：[整体设计 v3](a5_async_afd_design.md)。本版只实施 DeepEP-AFD 小算子路径；GMM1、activation/quant、GMM2 属于外部计算链，必须遵守本文 Active gate 和输出生命周期，但不重新设计其数值内核。MegaMoE/MTE 不在本次接口展开范围。
 
 ## 1. 设计依据、范围和命名
 
@@ -698,23 +698,23 @@ Torch绑定需标记output、workspace和持久状态mutation，远端写也是�
 
 以下引用来自固定HEAD；“沿用”只代表可复用机制，未表示修改已经完成。
 
-- **S1 dispatch入口与UB**：[dispatch.hpp:27](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/impls/ep/dispatch.hpp:27)定义DispatchUBLayout及snake_case字段；[dispatch.hpp:551](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/impls/ep/dispatch.hpp:551)模板参数与559入口签名；[dispatch.hpp:651](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/impls/ep/dispatch.hpp:651)原全rank barrier。
-- **S2 接收epilogue**：[dispatch_copy_epilogue.hpp:175](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/impls/ep/dispatch_copy_epilogue.hpp:175)模板/签名及200 barrier；[dispatch_copy_epilogue.hpp:217](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/impls/ep/dispatch_copy_epilogue.hpp:217)histogram/stage/UB约束；[dispatch_copy_epilogue.hpp:464](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/impls/ep/dispatch_copy_epilogue.hpp:464)原metadata按token索引并保存各topk展开位置。
-- **S3 combine发送**：[combine.hpp:162](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/impls/ep/combine.hpp:162)签名和模板；[combine.hpp:207](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/impls/ep/combine.hpp:207)原barrier/peer加载；[combine.hpp:301](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/impls/ep/combine.hpp:301)rank partial路径，342附近最终强序完成请求。
-- **S4 combine接收**：[combine_reduce_epilogue.hpp:45](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/impls/ep/combine_reduce_epilogue.hpp:45)模板和完整签名；[combine_reduce_epilogue.hpp:102](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/impls/ep/combine_reduce_epilogue.hpp:102)seen_ranks/master_slot_mask及后续代表槽寻址。
-- **S5 地址与完成**：[handle.hpp:232](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/comm/handle.hpp:232)build_write_sqe及对称offset；[handle.hpp:358](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/comm/handle.hpp:358)post_write/put；[handle.hpp:398](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/comm/handle.hpp:398)CQ owner/status处理；[handle.hpp:451](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/comm/handle.hpp:451)drain。
-- **S6 host约束与scale类型**：[ep.hpp:88](D:/Code/refs/DeepEP-Ascend/csrc/buffers/ep.hpp:88)dispatch接口；[ep.hpp:138](D:/Code/refs/DeepEP-Ascend/csrc/buffers/ep.hpp:138)expert/rank及BF16/FP8、sf dtype/stride校验；[ep.hpp:411](D:/Code/refs/DeepEP-Ascend/csrc/buffers/ep.hpp:411)combine接口和src_metadata `[K+2]`校验；[compiled.hpp:33](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/common/compiled.hpp:33)sf_pack_t及32B常量。
-- **S7 barrier拆分**：[barrier.hpp:115](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/comm/barrier.hpp:115)依次执行MTE3依赖、本地SyncAll、jetty drain、远端全组信号；只抽取本地部分，不能整段删除。
-- **S8 wire布局**：[token.hpp:16](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/layout/ep/token.hpp:16)TokenLayout及字段offset；[token.hpp:92](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/layout/ep/token.hpp:92)BufferLayout对称来源维度。
+- **S1 dispatch入口与UB**：[dispatch.hpp:27](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/impls/ep/dispatch.hpp#L27)定义DispatchUBLayout及snake_case字段；[dispatch.hpp:551](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/impls/ep/dispatch.hpp#L551)模板参数与559入口签名；[dispatch.hpp:651](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/impls/ep/dispatch.hpp#L651)原全rank barrier。
+- **S2 接收epilogue**：[dispatch_copy_epilogue.hpp:175](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/impls/ep/dispatch_copy_epilogue.hpp#L175)模板/签名及200 barrier；[dispatch_copy_epilogue.hpp:217](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/impls/ep/dispatch_copy_epilogue.hpp#L217)histogram/stage/UB约束；[dispatch_copy_epilogue.hpp:464](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/impls/ep/dispatch_copy_epilogue.hpp#L464)原metadata按token索引并保存各topk展开位置。
+- **S3 combine发送**：[combine.hpp:162](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/impls/ep/combine.hpp#L162)签名和模板；[combine.hpp:207](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/impls/ep/combine.hpp#L207)原barrier/peer加载；[combine.hpp:301](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/impls/ep/combine.hpp#L301)rank partial路径，342附近最终强序完成请求。
+- **S4 combine接收**：[combine_reduce_epilogue.hpp:45](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/impls/ep/combine_reduce_epilogue.hpp#L45)模板和完整签名；[combine_reduce_epilogue.hpp:102](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/impls/ep/combine_reduce_epilogue.hpp#L102)seen_ranks/master_slot_mask及后续代表槽寻址。
+- **S5 地址与完成**：[handle.hpp:232](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/comm/handle.hpp#L232)build_write_sqe及对称offset；[handle.hpp:358](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/comm/handle.hpp#L358)post_write/put；[handle.hpp:398](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/comm/handle.hpp#L398)CQ owner/status处理；[handle.hpp:451](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/comm/handle.hpp#L451)drain。
+- **S6 host约束与scale类型**：[ep.hpp:88](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/csrc/buffers/ep.hpp#L88)dispatch接口；[ep.hpp:138](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/csrc/buffers/ep.hpp#L138)expert/rank及BF16/FP8、sf dtype/stride校验；[ep.hpp:411](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/csrc/buffers/ep.hpp#L411)combine接口和src_metadata `[K+2]`校验；[compiled.hpp:33](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/common/compiled.hpp#L33)sf_pack_t及32B常量。
+- **S7 barrier拆分**：[barrier.hpp:115](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/comm/barrier.hpp#L115)依次执行MTE3依赖、本地SyncAll、jetty drain、远端全组信号；只抽取本地部分，不能整段删除。
+- **S8 wire布局**：[token.hpp:16](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/layout/ep/token.hpp#L16)TokenLayout及字段offset；[token.hpp:92](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/layout/ep/token.hpp#L92)BufferLayout对称来源维度。
 
 ## 附录 B. 本地 skill 与采用内容
 
-- [ascendc-operator-design](C:/Users/puxiaokun/.agents/skills/ascendc-operator-design/SKILL.md)：采用其设计模板，并读取templates/design-template.md、references/general-tiling-principles.md及index-tiling.md。索引示例的A2/A3核数/UB/指令假设不直接用于A5。
-- [ascendc-api-best-practices](C:/Users/puxiaokun/.agents/skills/ascendc-api-best-practices/SKILL.md)：读取api-datacopy.md、api-pipeline.md、api-hcomm.md；重点应用搬运粒度、跨pipe依赖和提交/完成区分。标准Hcomm API不是本基线手工HcommJetty的可替换签名。
-- [ascendc-tiling-design](C:/Users/puxiaokun/.agents/skills/ascendc-tiling-design/SKILL.md)：采用核间/核内两级设计、实际UB查询和分支覆盖；通信/调度属于自定义组合，非普通elementwise。
-- [ascendc-docs-search](C:/Users/puxiaokun/.agents/skills/ascendc-docs-search/SKILL.md)：读取API索引，检查本地ASC_DEVKIT_DIR并检索官方资料。skill所述A3/8.5环境不是本机或目标A5环境事实。
-- [ascendc-operator-code-review](C:/Users/puxiaokun/.agents/skills/ascendc-operator-code-review/SKILL.md)：审查输入是本文签名、偏移公式和状态伪代码；规则为整数溢出、共享状态所有权及动态shape接口。参考02_ascendc_overflow_patterns.md、06_concurrency_safety.md、07_operator_interface.md。
-- [model-infer-graph-mode](D:/Code/mine/vllm-afd-plugin/.agents/skills/model-infer-graph-mode/SKILL.md)：采用图外固定分配、warmup/replay分离和禁止host动态读取的设计检查，未执行模型适配或声称capture已通过。
+- `ascendc-operator-design`（本地 skill 参考）：采用其设计模板，并读取templates/design-template.md、references/general-tiling-principles.md及index-tiling.md。索引示例的A2/A3核数/UB/指令假设不直接用于A5。
+- `ascendc-api-best-practices`（本地 skill 参考）：读取api-datacopy.md、api-pipeline.md、api-hcomm.md；重点应用搬运粒度、跨pipe依赖和提交/完成区分。标准Hcomm API不是本基线手工HcommJetty的可替换签名。
+- `ascendc-tiling-design`（本地 skill 参考）：采用核间/核内两级设计、实际UB查询和分支覆盖；通信/调度属于自定义组合，非普通elementwise。
+- `ascendc-docs-search`（本地 skill 参考）：读取API索引，检查本地ASC_DEVKIT_DIR并检索官方资料。skill所述A3/8.5环境不是本机或目标A5环境事实。
+- `ascendc-operator-code-review`（本地 skill 参考）：审查输入是本文签名、偏移公式和状态伪代码；规则为整数溢出、共享状态所有权及动态shape接口。参考02_ascendc_overflow_patterns.md、06_concurrency_safety.md、07_operator_interface.md。
+- `model-infer-graph-mode`（本地 skill 参考）：采用图外固定分配、warmup/replay分离和禁止host动态读取的设计检查，未执行模型适配或声称capture已通过。
 
 ## 附录 C. 启动配置、状态编码与错误契约补充
 

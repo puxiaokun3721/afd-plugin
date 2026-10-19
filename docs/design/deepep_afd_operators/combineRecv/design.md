@@ -154,7 +154,7 @@ masked token 不读取expert_idx和weights中的无效值，直接输出零；�
 
 ## 8. 源码与交付状态
 
-[原epilogue入口](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/impls/ep/combine_reduce_epilogue.hpp:45)、[原数值归约](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/impls/ep/combine_utils.hpp:15)、[RingReducer](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/impls/ep/combine_utils.hpp:97)、[原launcher](D:/Code/refs/DeepEP-Ascend/csrc/kernels/ep/combine.hpp:65)。API补充依据：[arithmetic最佳实践](C:/Users/puxiaokun/.agents/skills/ascendc-api-best-practices/references/api-arithmetic.md:80)。
+[原epilogue入口](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/impls/ep/combine_reduce_epilogue.hpp#L45)、[原数值归约](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/impls/ep/combine_utils.hpp#L15)、[RingReducer](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/impls/ep/combine_utils.hpp#L97)、[原launcher](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/csrc/kernels/ep/combine.hpp#L65)。API补充依据：[arithmetic最佳实践](C:/Users/puxiaokun/.agents/skills/ascendc-api-best-practices/references/api-arithmetic.md#L80)。
 
 按skill提供接口、API序列、两级tiling、UB系数、workspace、精度和实施检查清单。编译、跨通路可见性、图和A5性能均为待验收，不能将本文视为已运行代码。
 

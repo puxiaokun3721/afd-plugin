@@ -323,3 +323,8 @@ consider citing it:
   howpublished={\url{https://github.com/vllm-project/afd-plugin}},
 }
 ```
+
+
+## A5 异步 AFD 设计
+
+[当前设计、实现说明与验证边界](docs/design/README.md)。

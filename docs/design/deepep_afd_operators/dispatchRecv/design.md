@@ -147,6 +147,6 @@ BF16/FP8均位搬运，不调用Cast，不重解释SF内容。padding hidden/sf�
 
 ## 8. 参考与交付状态
 
-[原epilogue签名](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/impls/ep/dispatch_copy_epilogue.hpp:175)、[stage与UB](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/impls/ep/dispatch_copy_epilogue.hpp:217)、[metadata与SF](D:/Code/refs/DeepEP-Ascend/deep_ep/include/deep_ep/impls/ep/dispatch_copy_epilogue.hpp:464)、[host launcher](D:/Code/refs/DeepEP-Ascend/csrc/kernels/ep/dispatch.hpp:84)。
+[原epilogue签名](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/impls/ep/dispatch_copy_epilogue.hpp#L175)、[stage与UB](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/impls/ep/dispatch_copy_epilogue.hpp#L217)、[metadata与SF](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/deep_ep/include/deep_ep/impls/ep/dispatch_copy_epilogue.hpp#L464)、[host launcher](https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377d04b24fc6154698ded78a2bcb2c59afff/csrc/kernels/ep/dispatch.hpp#L84)。
 
 DoD：签名、类型、API映射、tiling结构/公式、各dtype UB表/例算、workspace、精度和实施测试项均已定义。scheduler内部算法不影响本接口：开发时可先以人工Active fixture验证本算子。

@@ -1,12 +1,12 @@
 # DeepEP-AFD 算子详细设计交付索引
 
-本组文档细化[五算子总设计](../a5_async_afd_deepep_operator_design_v1.md)，供开发人员直接在 DeepEP-Ascend 基线上改造。总设计和整体架构文档保持原样。本次只新增设计文档，不新增算子代码，不创建独立算子工程。
+本组文档细化[五算子总设计](../a5_async_afd_deepep_operator_design.md)，供开发人员直接在 DeepEP-Ascend 基线上改造。当前五算子开发实现及设备验收状态见[设计入口](../README.md)。
 
 ## 阅读顺序与交付件
 
 1. [公共契约](common_contract.md)：变量、ABI、wire layout、控制原语、位握手、图和错误边界。
 2. [dispatchSend](dispatchSend/design.md)：A侧去重发布，按tile重构上游dispatch，固定通信窗口。
-3. [ffnScheduler接口](ffnScheduler/design.md)：DP到齐、Active/Completion、专家prefix、两种credit策略；内部调度算法尚未确定。
+3. [ffnScheduler接口](ffnScheduler/design.md)：DP到齐、Active/Completion、专家prefix、两种credit策略；本文档范围为接口；当前内部实现见代码仓说明。
 4. [dispatchRecv](dispatchRecv/design.md)：从上游copy epilogue改造，按当前片route展开。
 5. [combineSend](combineSend/design.md)：从上游combine发送队列改造，逐route直发并提交完成。
 6. [combineRecv](combineRecv/design.md)：从上游reduce epilogue改造，A侧逐route FP32加权归并。
@@ -30,28 +30,13 @@ flowchart LR
 
 图中的控制边不表示host串行等待。A收发必须能并发；F执行链按当前Active串行，COMPUTE_AHEAD可在combine处等待credit并占住单workspace。
 
-## skill执行与要求对应
+## 设计范围
 
-主skill：[ascendc-operator-design](C:/Users/puxiaokun/.agents/skills/ascendc-operator-design/SKILL.md)。使用其design-template、general-tiling-principles、index-tiling、reduction-tiling；辅助参考本地api-best-practices的搬运/流水线/通信/算术资料，以及tiling、图模式和算子审查规则。没有启动模型端到端优化流程，没有执行code-gen。
-
-| skill要求 | 四个通信算子的交付位置 | ffnScheduler |
-| --- | --- | --- |
-| 完整函数声明、参数、dtype | 各文档§1，host与device入口 | §1完整接口 |
-| 计算逻辑与具体API序列 | 各文档§2，公共契约§4展开新增helper | 只定义可观察行为，内部API序列未交付 |
-| 两级tiling及结构体 | 各文档§3 | 按用户要求暂不设计 |
-| UB逐buffer、份数、系数、例算 | 各文档§3 | 按用户要求暂不设计 |
-| Workspace公式与生命周期 | 各文档§4、公共契约 | 输出ABI已定义，私有workspace待内部设计 |
-| FP16/BF16处理 | 搬运按位；combineRecv FP32乘加后RN转BF16；不支持FP16 | 整数/状态控制，无半精度数学 |
-| 性能和实现检查清单 | 各文档§5—7 | §6接口验收与后续门禁 |
-| 源码依据与实施位置 | 各文档§8、公共契约§6 | 明确为新增能力，不伪称原生已有 |
-
-交付路径对skill的适配：skill示例路径为`ascend-kernel/csrc/ops/<op>/design.md`，本任务明确只写独立设计文档、后续直接改DeepEP，因此保留逐算子`design.md`形态，存入当前docs目录；不生成无关项目骨架。公开名遵用户指定lowerCamelCase，内部保持DeepEP snake_case/模板命名。图预分配使用void out接口，替代模板的单Tensor返回示例。以上是任务约束下的显式适配，不声称逐字遵循示例路径和示例函数。
-
-同名接口检查：当前NumPy无这五个公开名称；本机未安装torch，官方文档限定域检索未找到对应名称，尚未做torch运行时检查。不得把它记录成已执行的torch检查。四个通信文档覆盖设计交付结构，但目标平台API和协议门禁未验收，不能直接标为生产实施无阻断。scheduler按用户缩小的范围交付接口，**不标记为完整skill DoD通过**。
+四个通信算子的文档按 Ascend C 算子设计模板组织接口、算法、tiling、UB、workspace 和验证门禁。ffnScheduler 文档只覆盖接口和可观察契约，不能作为完整内部设计交付。最初的 skill 执行记录保留在本地归档。
 
 ## DeepEP基线与复用策略
 
-检出commit：`3b25377d04b24fc6154698ded78a2bcb2c59afff`，目录`D:/Code/refs/DeepEP-Ascend`，本轮再次用git rev-parse确认。源码引用均针对这个本地commit，不推断其他分支或A3行为等于A5。
+原生参考commit：`3b25377d04b24fc6154698ded78a2bcb2c59afff`，目录`D:/Code/refs/DeepEP-Ascend`。源码引用针对这个固定commit，不推断其他分支或A3行为等于A5。
 
 | 算子 | 原生基础 | 必要改造 |
 | --- | --- | --- |
@@ -60,7 +45,7 @@ flowchart LR
 | combineSend | combine_impl、load_meta_issue_wqe、HcommJetty | 删除rank内归并与hidden镜像，逐route写回，末片完成提交 |
 | combineRecv | combine_reduce_epilogue_impl、RingReducer | 去掉rank-partial去重归并；固定topk顺序FP32乘权，分轮输出完整BS |
 
-代码计划位置位于DeepEP的`impls/afd/`、`layout/afd/`、`csrc/kernels/afd/`、`csrc/buffers/afd.hpp`，复用原JIT与资源管理；原EP路径保持独立。逐请求CQE及tile drain是首版简化选择，可能降低原生峰值吞吐；后续可恢复batch WQE/multi-SGE，但必须保留完成覆盖和源buffer生命周期证明。不会声称所有底层逻辑原样复用。
+代码位置位于DeepEP的`impls/afd/`、`layout/afd/`、`csrc/kernels/afd/`、`csrc/buffers/afd.hpp`，复用原JIT与资源管理；原EP路径保持独立。当前发送路径已采用有界批量 WQE 构建，仍保留逐 WR CQE 和 tile drain；具体实现边界见代码仓说明，不声称全部原生流水已恢复。
 
 ## 算术核对
 
@@ -95,13 +80,11 @@ flowchart LR
 - A send/recv等待kernel可共存、F全域错误终止可执行、图capture/replay保持事件DAG与持久位。
 - combineRecv新向量primitive具体重载、原地算术与事件可编译；FP8 SF布局与GMM兼容。BF16先验收，FP8不能仅因可搬运就默认计算可用。
 
-仍需设计：scheduler私有状态/资源查询、选择算法、公平性、核内实现和预算；这部分按用户要求留在下一阶段。其他通信算子的上下游契约已列明，其平台门禁未通过前不能宣称实现已验证。
-
-本轮校验仅包括文档结构、签名一致性、链接、公式和输入文档保持不变；没有NPU编译、性能或精度运行结果。
+scheduler 内部已有开发实现，独立设计文档仍以接口为主。CPU 检查不能替代设备验收；平台门禁通过前不能宣称实现已验证。
 
 ## 容量澄清与验收用例
 
-32k/256k maxBS指单Attention rank完整事务容量；单lane窗口C_m独立配置，DP容量为成员求和，无固定32k合计上限。字段和轮次以common_contract.md为准。F预留按所有注册来源槽求和，A按自身槽求和，Q/Q_alloc只控制单计算片。scheduler/combine尚无完整实现，以下用例先验证模型与接口，不能称设备调度已通过：
+32k/256k maxBS指单Attention rank完整事务容量；单lane窗口C_m独立配置，DP容量为成员求和，无固定32k合计上限。字段和轮次以common_contract.md为准。F预留按所有注册来源槽求和，A按自身槽求和，Q/Q_alloc只控制单计算片。以下用例用于模型和设备验收，不能因已有开发实现便称设备调度已通过：
 
 | 用例 | 必须检查 |
 | --- | --- |
