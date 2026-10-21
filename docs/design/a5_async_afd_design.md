@@ -949,9 +949,11 @@ sequenceDiagram
 
 考虑 F0 已算通信轮 n，等待它的 credit(n)。若 n 为首次，credit 来自启动初始化；若 n 为后续轮，Ready(n) 已存在说明 A 收齐全 F Consumed(n-1)。保守顺序进一步说明全 F 的结果(n-1)与 Done(n-1)都已完成。
 
-因此缺少 credit(n) 只依赖 A 对上一返回轮的本地归并/clear，不依赖任何尚未调度的 F 计算。多成员、多 DP 聚合只是多个同性质依赖，不产生 F0 等 F1 新计算、F1 又等 F0 新计算的环。
+因此 credit(n) 对应的上一返回轮已经具备归并条件，但这**不自动证明 A 的归并任务能获得执行机会**。还必须保证 A 在所有活动物理槽之间公平处理已就绪的轮：不能把 mb1 的上一轮归并排在“收完 mb0 所有轮”之后。多成员、多 DP 聚合时，每个 member 所在 A 都必须满足这个条件。
 
-此证明要求 A recv 已可运行、不等待整个多轮 send、不在发 credit 前等待未完成的 TP/CP 模型 collective，并且 A 有执行资源。不能把这些条件藏在“多 stream”一词中。若违反，例如 `send(n+1)等ACK → F等credit(n+1) → recv等整个send结束`，立即形成循环等待。
+满足逐槽公平推进后，缺 credit 只等待一个已经全 F Done 的旧轮被 A 读取；一个有限 sweep 会访问它，未就绪槽不会挡住它，不再依赖当前被阻塞的 F 计算。此证明仍要求 recv 不等待整个多轮 send、不在发 credit 前等待未完成的 TP/CP 模型 collective，并且 A 有执行资源。两个 stream 本身不能保证这些条件；默认 compute-ahead 的队头阻塞仍然存在。
+
+反例（Q=4，mb0/mb1 各有独立槽，均两通信轮；同 phase/layer）：F0 先处理 mb0 最后一轮的前4/6行，同时关闭 mb1 的零 route 首轮；其他 F 也关闭 mb1 首轮，A 因而可以发布 mb1 第二轮。F0 下一片包含 mb0 的剩余2行和 mb1 第二轮的有效行，首次返回前等待 mb1 新 credit。如果 A 仍在执行完整 `recv(mb0)`，则形成 `F0等mb1 credit → A尚未执行mb1首轮归并 → A等mb0末轮Done → F0`。零 route 首轮已有启动 credit，故仅修复零 route 调度过滤不能消除此环。
 
 作者提出“未授权候选留 Pending、可绕过”是 PRECHECK 的进度规则，不能提升为所有正确实现的必要条件。默认 compute-ahead 接受队头阻塞；要再绕过已占 workspace 的任务，需额外保存结果/执行状态并重新预算，本版不做。
 
@@ -998,6 +1000,21 @@ recv: wait Ledger0 → allDone0 → reduce/clear → credit1
 ```
 
 多轮 recv 返回后，框架在回收流以 `wait(Epub_final) → wait(Erecv) → record(Etxn)` 汇合。不能把 wait(Epub_final) 移到 recv kernel 前，否则重建等待环。最终远端 ACK 也不证明本地 send kernel 的尾部、send_status 写入或退出已经完成。
+
+**多个本地槽与多通信轮同时存在时，使用同一个 combineRecv 的 round-step 模式。** 单个调用最多归并本槽一个已就绪轮；Ledger、全 F Done 或最终 Consumed 未齐均返回“仍在推进”，不在该槽自旋。A 在独立 recv stream 上固定轮转全部活动槽，每轮转一遍称为一个 sweep，重复直到所有事务完成或域超时。只增加每槽96B进度元数据（TaskInfo快照、next_round和最终输入位等），共享原单份recv scratch；没有第二份hidden结果或完整事务缓存。
+
+```mermaid
+flowchart LR
+    S0[slot0：probe一轮] --> S1[slot1：probe一轮]
+    S1 --> SN[其余活动槽：逐个probe]
+    SN --> C{所有事务完成?}
+    C -->|否：下一sweep| S0
+    C -->|是| J[逐事务汇合 Epub 与接收完成]
+```
+
+每个 probe 若未就绪就跳过，若就绪则复用原归并流水，读完该轮后发布 credit、释放 Ledger。最后 ACK 未齐时也跳过，不能把阻塞从 Done 等待搬到 ACK 等待。调用者必须持续服务所有活动槽，不能通过一次 probe 的kernel退出就释放事务。图中一次 capture 可包含固定槽序的一个 sweep；首次 start 与后续 sweep 分离，replay不重置进度，单次graph不承诺全部事务完成。每槽 routing/mask/output/TaskInfo 地址保持稳定至Etxn。
+
+兼容的全事务阻塞模式仅准入“本A只有一个已注册槽，可多轮”或“本A多个槽，但每事务只有一轮”。当前DeepEP host初始化冻结 `return_progress_mode`，send和recv都校验准入，多槽多轮必须显式选择round-step并接受公平驱动契约。P单槽跨mb复用和D单轮M=2/3保留；不能靠关闭默认compute-ahead掩盖不安全的接收排队方式。
 
 ```mermaid
 flowchart LR
@@ -1053,8 +1070,10 @@ ffn_commit(Context, Active, ExecutionState, Completion)
   非终结条目: 仅提交游标和HELD；最后发布Completion.READY
 
 combine_recv(Context, ATask, SlotRecvState, RoundLedger, output)
-  每轮等全F Done→归并/clear→回收Ledger→发布下一credit
-  最终轮还等全F最终Consumed（所需位值在回收Ledger前复制到SlotRecvState）；输出recv_status=RESULTS_AND_ACK_COMPLETE
+  全事务模式按轮等待；round-step模式仅probe当前轮，未就绪立即结束本次调用
+  就绪轮全F Done→归并/clear→发布下一credit→释放Ledger
+  最终Consumed所需位在回收Ledger前复制到SlotRecvState；step模式未齐仍返回
+  全部轮与最终ACK完成才输出recv_status=RESULTS_AND_ACK_COMPLETE
 
 mega_execute(Context, Active, ExecutionState, LayerTable, Workspace)
   取代gather至combine的主体，遵守同一grant/commit契约；保留wave

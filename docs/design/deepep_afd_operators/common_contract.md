@@ -103,6 +103,10 @@ input_ready/Done/Consumed初值1，credit初值0，首次期待0；每轮全F都
 
 A workspace拆send/recv两份，Ledger严格SPSC两bank；不允许图alias分析强制send全事务后才recv。F执行链每次scheduler→recv→GMM→send，单Active；GMM2适配尾部在全片写完后设置COMPUTE_READY。CONTROL跳过GMM但经combineSend完成；NOP不产生Completion。错误不能让单核提前退出并遗留SyncAll参与者，错误状态先本地一致广播再走域终止。
 
+多本地槽多通信轮使用 combineRecv round-step：同一接收stream依次probe所有活动槽，未到齐不等待，每次至多归并一轮；最终ACK同样非阻塞。每槽额外96B持久进度、共享单recv scratch，固定地址的首次start与重复sweep分离。全事务模式只准入单本地注册槽，或多槽单轮。Context原reserved字段命名为`return_progress_mode`（0=全事务，1=round-step），结构长度不变；初始化冻结，send与recv共同校验，旧二进制不得处理mode=1。完整调用契约见[combineRecv](combineRecv/design.md)，活性证明见[总体设计§4.5.2](../a5_async_afd_design.md#452-单-workspace-先算后等的进度证明)。
+
+CONTROL（包括WORK中的零行entry）只有全部成员credit可用才选入Active；非空组仍保留COMPUTE_AHEAD。Pending私有原reserved 4B保存`num_remaining_routes`，在接纳时由已检查的count求和、应用Completion时按delta扣减，并与count/cursor核验；Pending保持96B，wire、Ready/Consumed/Done/credit及Q/Q_alloc均不变。
+
 错误码OK=0,BAD_ABI=1,BAD_TASK=2,BAD_LAYER=3,BAD_ROUTE=4,CAPACITY=5,STATE_ORDER=6,TIMEOUT=7,TRANSPORT=8。host异步提交返回不代表device成功；32B status内state/error/round记录进度，成功条件以具体算子文档为准。
 
 ## 6. 配置验证与代码落点

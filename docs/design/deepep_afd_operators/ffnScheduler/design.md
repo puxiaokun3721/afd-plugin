@@ -85,6 +85,7 @@ Context选择 `COMPUTE_AHEAD` 或 `PRECHECK`，两者共享上述参数与结果
 | 条件 | COMPUTE_AHEAD | PRECHECK |
 | --- | --- | --- |
 | 新条目无credit | 可输出WORK，grant=NONE | 不选，可选其他已授权候选 |
+| 全成员剩余route为零 | 两种策略均先核对全部member credit；不足则留Pending并扫描其他组 | 同左 |
 | 新条目credit已可用 | 可由combineSend取得；不要求scheduler预取 | 被选后记录HELD；未被选不占grant |
 | Continuation | 继承HELD，不二次消耗 | 同左 |
 | 计算完成但credit未到 | combineSend等待，x和单workspace保留 | 正常不发生；仍核验身份 |
@@ -167,9 +168,9 @@ UB为256B结构搬运临时区及五个A32(4R)向量：counts、consumed、当�
 1. 如果Completion=READY，先全量校验member唯一性、delta边界、连续entry成员区间及FINISHED对应全部route已耗尽，再应用delta；不从旧Inbox恢复任何字段。FINISHED清除Pending.valid并翻expected_input_bit；HELD续片保持输入位、快照和授权。READY清为EMPTY，第二次应用不可能通过COMMITTED/READY门禁。ARMED未完成重入视为STATE_ORDER，发布ABORT，不能覆盖为正常NOP。
 2. 对空Pending读取本地InputReady32B，仅匹配期待位时快照Inbox及R维count。校验layer、轮号、单lane容量、返回bit和route总量。已有Pending不重新读取Inbox。prefix/count细节一致性继续由dispatchRecv校验，在通过前不会产生成功输入ACK。
 3. 分组键为`(dp,phase,microbatch,layer,round,num_comm_rounds)`。一个静态member的不同slot不增加成员数；必须为每个静态member找到恰好一个匹配Pending。缺员等待，重复member报错。最小lane编号为组leader，仅用于本F本地枚举，不引入F leader。
-4. 在完整候选组中，上次phase之外有候选时优先选另一phase，满足连续phase上限1。phase内选择first_seen最早的组，并采用其layer；年龄是本F首次发现该组任一成员的kernel调用序号，不是全局时钟或时延保证。PRECHECK先过滤未获得全部member credit的候选；COMPUTE_AHEAD不做该过滤。Continuation的HELD免重复credit取得。
+4. 在完整候选组中，上次phase之外有候选时优先选另一phase，满足连续phase上限1。phase内选择first_seen最早的组，并采用其layer；年龄是本F首次发现该组任一成员的kernel调用序号，不是全局时钟或时延保证。PRECHECK过滤未获得全部member credit的候选；COMPUTE_AHEAD只对有剩余route的组允许先算后等。全组零route必须先核对credit，即使它将被聚合进WORK Active也不能跳过。单个零route成员属于非空DP组时仍按整组WORK处理。Continuation的HELD免重复credit取得。
 5. 首组优先，随后按循环lane序聚合同phase/layer的其他到齐组，支持同DP多个microbatch和跨DP。每(member,expert)最多一个连续Segment。route_begin为该专家prefix起点加cursors，而非专家内相对下标；dst_row_begin先记录专家内有效行偏移，全部选择完再加当前片专家padding prefix。
-6. 每次取行同时限制Q和QA。令当前专家有效行c、已padding行p=align_a(c)、当前总物理行P，则还能容纳`floor((p+QA-P)/a)*a-c`行，同时不能超过Q剩余额度。零进度且尚有route的组不输出、不占grant；真正零route到齐组仍输出CONTROL或WORK中的零行entry。QA>=a保证非空候选能取得至少一行。
+6. 每次取行同时限制Q和QA。令当前专家有效行c、已padding行p=align_a(c)、当前总物理行P，则还能容纳`floor((p+QA-P)/a)*a-c`行，同时不能超过Q剩余额度。零进度且尚有route的组不输出、不占grant；真正零route到齐且credit齐备的组输出CONTROL或WORK中的零行entry。QA>=a保证非空候选能取得至少一行。
 7. 写表、prefix、execution SELECTED、completion ARMED全部完成，最后写Active有效header。若无候选则NOP并清prefix；异常ABORT并清prefix。所有失败进入域失败流程，不通过伪ACK继续。
 
 | Pending阶段 | 输入引用 | grant | 下一步 |

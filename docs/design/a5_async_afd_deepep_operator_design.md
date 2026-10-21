@@ -18,7 +18,7 @@
 
 ### 1.2 源码基线与事实
 
-DeepEP-Ascend 实际 HEAD：`3b25377d04b24fc6154698ded78a2bcb2c59afff`，目录 `D:/Code/refs/DeepEP-Ascend`。下文“原生”均指此版本。源码入口与行号见附录 A。
+DeepEP-Ascend 原生参考基线：`3b25377d04b24fc6154698ded78a2bcb2c59afff`，目录 `D:/Code/refs/DeepEP-Ascend`。下文“原生”均指此版本，不能将其当作AFD工作区当前HEAD。2026-10-21静态修复开始时AFD HEAD为`dcad2ca0f8383dcd99402d95ac9952e54ece2cb5`，本次修改在其上进行。原生源码入口与行号见附录 A。
 
 | 目标算子 | 原生主要入口 | 可直接保留的命名/机制 | 必须替换的语义 |
 | --- | --- | --- | --- |
@@ -53,7 +53,7 @@ flowchart LR
     CR -->|ReturnCredit| CS
 ```
 
-`dispatchSend` 和 `combineRecv` 各覆盖一次完整 MoE 事务，内部按通信轮循环；F 的三个算子每次服务迭代处理一个 Active 计算片或控制任务。`ffnScheduler` 只扫描一遍有界 Pending/lane 表，不无限等待新任务；没有可选任务时输出 NOP，后续节点执行有界 no-op，框架继续下一服务迭代。
+`dispatchSend` 覆盖一次完整 MoE 事务，内部按通信轮循环。`combineRecv` 支持受限的全事务模式，以及多槽多轮必需的round-step模式：一次只probe/归并当前一轮，未就绪返回，框架在同一recv stream公平轮转所有活动槽。两者共用原归并流水和单scratch，每槽增加96B进度元数据；一次step退出不代表事务完成。F 的三个算子每次服务迭代处理一个 Active 计算片或控制任务。`ffnScheduler` 只扫描一遍有界 Pending/lane 表，不无限等待新任务；没有可选任务时输出 NOP，后续节点执行有界 no-op，框架继续下一服务迭代。
 
 | 算子 | 调用一次处理的单位 | 正常返回保证 | 不保证 |
 | --- | --- | --- | --- |
@@ -61,7 +61,7 @@ flowchart LR
 | ffnScheduler | 一次有界扫描和选片 | Completion 已应用；新 Active/执行状态/专家 prefix 已就绪，或 NOP/ABORT | payload 已展开、结果已返回 |
 | dispatchRecv | 一个 Active 片 | recv_x/recv_sf 和本片 src metadata 可供计算使用 | 整通信轮输入可回收 |
 | combineSend | 一个 Active 片 | 本片传输 drain 完成；Completion READY；若条目末片，已 Done→Consumed | A 已读走返回、下一轮已有 credit |
-| combineRecv | 一个 A 成员的一个 mb/layer 事务 | 每轮已归并，最终轮全 F ACK 已观察，recv 本地退出 | send 本地已退出；必须另做 Etxn join |
+| combineRecv | 全事务模式：一个事务；round-step：本槽至多一个已就绪轮 | 只有完成状态才保证全部归并及最终全F ACK；未就绪step无payload/credit写 | 普通step退出不代表事务完成；完成后仍须 Etxn join |
 
 FFN 循环是 `ffnScheduler → dispatchRecv → gated GMM1/activation/GMM2 → combineSend`。不再要求调用者猜测一个第六个 commit 算子；commit 是 combineSend 的末尾阶段，包括 CONTROL 任务。下一 scheduler 在吸收新 Ready 之前应用 Completion。
 
@@ -229,12 +229,12 @@ void combineRecv(
     const at::Tensor& task_info, const at::Tensor& context,
     at::Tensor& buffer, at::Tensor& control_buffer,
     at::Tensor& round_ledger, at::Tensor& workspace,
-    at::Tensor& combined_x, at::Tensor& recv_status);
+    at::Tensor& combined_x, at::Tensor& recv_status, bool start = false);
 ```
 
 `recv_sf`为可写optional Tensor句柄，注册schema必须声明其底层storage mutation；非FP8时传空，不得用未初始化地址代替。没有返回动态tuple、Python epilogue callback、CPU counts同步或调用内分配。kernel完成用运行流事件表达，host函数返回只是提交，不等价于表中device完成条件。
 
-A的send_workspace与recv_workspace是不同分配，只通过显式RoundLedger及控制区通信；不能将两者包装为一个全量read/write依赖再强制串行。单轮D先发布M个槽，再按槽接收；多轮A收发从第一轮Ledger即可重叠，禁止recv等最终send事件。图集成必须保留这一事件DAG，不能依赖自动alias分析猜测控制流。
+A的send_workspace与recv_workspace是不同分配，只通过显式RoundLedger及控制区通信；不能将两者包装为一个全量read/write依赖再强制串行。单轮D先发布M个槽，再按槽接收；多轮A收发从第一轮Ledger即可重叠，禁止recv等最终send事件。多个本地槽且多轮必须初始化round-step模式，首次start=True与随后所有活动槽的start=False公平sweep分离；见[完整接口及状态表](deepep_afd_operators/combineRecv/design.md)。图集成必须保留这一事件DAG，不能依赖自动alias分析猜测控制流。
 
 ### 4.2 张量 shape、dtype 与输入生命周期
 
@@ -298,10 +298,11 @@ __global__ __vector__ void combine_send_impl(
 __global__ __vector__ void combine_recv_impl(
     __gm__ bfloat16_t* combined_x, __gm__ int64_t* combined_topk_idx,
     __gm__ float* topk_weights, __gm__ uint8_t* token_mask,
-    __gm__ bfloat16_t* buffer, __gm__ const AFDTaskInfo* task_info,
+    __gm__ uint8_t* buffer, __gm__ const AFDTaskInfo* task_info,
     __gm__ const AFDContextLayout* context, __gm__ void* control_buffer,
     __gm__ AFDRoundLedger* round_ledger, __gm__ void* workspace,
-    __gm__ uint32_t* recv_status);
+    __gm__ uint32_t* recv_status,
+    __gm__ AFDReturnProgress* return_progress, const bool start);
 ```
 
 `rank_idx`来自静态F配置；A的src_rank_idx来自task_info并校验与Context一致。`num_tokens`/`num_combined_tokens`从稳定device描述读取，保留变量名，避免host读取实际token数再构建图。`jetty_ptrs`由host Context资源注入，不让调用者随便拼装。新struct字段均按显式宽度、offset、对齐构建；实现时需static_assert及host/device布局单测。
@@ -482,6 +483,8 @@ mask=false的token不读取陈旧返回位置，直接写零；mask=true的token
 
 ### 9.2 按轮执行与最终收尾
 
+下面为准入后的全事务模式。多本地槽多轮使用同一归并主体的round-step模式：一次最多一个ready轮，Ledger/Done/最终ACK缺失均立即结束本次调用；保存next_round，持续公平服务其它槽。每槽先start一次，后续sweep不重置状态，DONE后还须本地事件汇合；一次step退出不是RECEIVED。全事务模式在send和recv共同拒绝不安全的多槽多轮配置。
+
 ```text
 combine_recv_impl:
   for round_idx in [0,num_comm_rounds):
@@ -492,15 +495,16 @@ combine_recv_impl:
       mask=true: 逐k load BF16 -> FP32，乘FP32权重，累加
       FP32 -> BF16，写combined_x[token_begin+round_token]
     本地所有核确认读取返回区结束、输出写完成
-    回收Ledger为EMPTY；按配置清理返回区需要的内部元数据
+    按配置清理返回区需要的内部元数据
     expected_return_bit ^= 1；publish全部F的下一credit
+    完成credit写后回收Ledger为EMPTY，保存next_round/last_input_bit
   wait最终input_bit对应的所有F dispatch_consumed
   recv_status=RECEIVED
 ```
 
 DeepEP-AFD独立Done模式不要求把整个返回payload清零；必须初始化/清理的是本实现使用的元数据。每个有效route都会重写，masked位置从不读，故可省大窗口清零。若调试选择清零，必须在发credit之前结束，不能后台清零覆盖下一轮写入。
 
-Ledger回收后再发credit仍安全：send最多先填下一轮，不能越过等待该credit的F完成再填第三轮。最终事务由框架`Etxn=join(Epub_final,Erecv)`收尾，随后才更新task_info、路由、输入和P跨mb槽归属。
+实现统一采用credit写完成后释放Ledger；最终input_bit在释放前复制到接收进度，不从已释放bank恢复。最终事务由框架`Etxn=join(Epub_final,Erecv)`收尾，随后才更新task_info、路由、输入和P跨mb槽归属。round-step须所有轮及最后ACK均完成，再以最后sweep退出事件参与该join。
 
 ### 9.3 API 精度与核分工
 
@@ -584,10 +588,11 @@ dispatchSend选择最大合法T_s满足`sizeof(AFDDispatchUBLayout(T_s,...))+met
 | F Inbox/counts/prefix/routes | 每lane64B；每lane R个count+R个prefix；route最多`4×sum_lane C_m×min(K,R)` |
 | A路由准备 | `dst_buffer_slot_idx` 4C_mK；tile_rank/expert counts及prefix至多`8×ceil(C_m/T_s)×(N_F+E)`；本轮route表及metadata staging另列 |
 | A metadata_send_buffer | `C_m×metadata_stride`；包含sf及原topk信息，单轮共用，不复制hidden |
-| F调度 | Pending O(LR+L)；ActiveEntry O(LR)、ActiveSegment≤24LR；Completion O(LR)，全部显式布局对齐 |
+| F调度 | Pending `32+96L+2A32(4LR)`；Active `64+64L+32LR`（Entry/Member各L项，Segment物理stride32B）；Completion `32+64L+A32(4LR)` |
+| F recv预检scratch | `32N_r+256+2A32(4min(LR,Q))`；后两项有界Segment索引，Q32k最多增加256KiB，非hidden镜像 |
 | F recv_src_metadata | `16Q_alloc`，当前片单份 |
 | F recv_x/recv_sf/GMM中间/GMM2 | 根据dtype、Q_alloc、H/I和库workspace算存活峰值；不能只报GMM2 |
-| A RoundLedger | 每lane2项固定结构，只有标量/token区间，无B×H副本 |
+| A RoundLedger/返回进度 | 本A每物理槽2个64B Ledger；round-step另每槽96B progress；单份归并scratch `256+A32(32N_c)`，无B×H副本 |
 | W_transport | 所有SQ/CQ、peer/jetty对象、注册资源、临时描述符及平台空间；从实际资源返回值合计 |
 
 A路由准备按一个发送流的最大C_m暂存复用，不为每D槽复制一套临时准备区；但在上次发送drain及本地退出前不可覆盖。F同一计算workspace只服务一个Active；GMM2结果作为注册URMA源直发。原上游combine send_buffer不分配；原metadata大小、对称buffer helper不能直接用于AFD申请。

@@ -19,20 +19,26 @@ void combineRecv(
     const at::Tensor& task_info, const at::Tensor& context,
     at::Tensor& buffer, at::Tensor& control_buffer,
     at::Tensor& round_ledger, at::Tensor& workspace,
-    at::Tensor& combined_x, at::Tensor& recv_status);
+    at::Tensor& combined_x, at::Tensor& recv_status,
+    bool start = false);
 ```
 
 ```cpp
 __global__ __vector__ void combine_recv_impl(
     __gm__ bfloat16_t* combined_x, __gm__ int64_t* combined_topk_idx,
     __gm__ float* topk_weights, __gm__ uint8_t* token_mask,
-    __gm__ bfloat16_t* buffer, __gm__ const AFDTaskInfo* task_info,
+    __gm__ uint8_t* buffer, __gm__ const AFDTaskInfo* task_info,
     __gm__ const AFDContextLayout* context, __gm__ void* control_buffer,
     __gm__ AFDRoundLedger* round_ledger, __gm__ void* workspace,
-    __gm__ uint32_t* recv_status);
+    __gm__ uint32_t* recv_status,
+    __gm__ AFDReturnProgress* return_progress, const bool start);
 ```
 
 ### 1.2 参数与支持范围
+
+host owner在图外调用`prepare_combine_recv(round_step=False, fair_round_robin=False)`。默认保留全事务模式；本A多个注册槽且任务多通信轮时必须使用`round_step=True, fair_round_robin=True`，并在同一个recv stream实际轮转所有活动槽。此确认参数只声明调用方义务，不能代替driver。context字段`return_progress_mode`在初始化冻结；device send在发布任何Ready前、recv在输出前都拒绝不安全的legacy组合，不能默默进入无限等待。
+
+round-step首次调用`start=True`接纳稳定TaskInfo，此后调用`start=False`；每次至多归并一个已全F Done的轮。该模式使用owner额外分配的`AFDReturnProgress[num_slots]`，不要求调用者手工分配或传入device指针。全事务模式禁止`start=True`，不分配progress。
 
 | 参数 | 方向、shape/dtype | 契约 |
 | --- | --- | --- |
@@ -58,6 +64,8 @@ __global__ __vector__ void combine_recv_impl(
 复用 `combine_reduce_epilogue_impl` 的核间 token 切分，以及 `RingReducer` 的 GM/UB 搬运和 stage 生命周期。新增加权 primitive 是必要的语义改造：原 `combine_reduce_vf` 的无权重 rank-partial 求和不能直接使用。首版保留其 BF16→FP32→BF16 的精度要求，采用下述 Ascend C 高层向量 API 表达加权序列；原 SIMD 的 conversion/store 代码可作为后续等价替换参考，不能把不同实现混算 UB。
 
 ### 2.2 API 级伪代码
+
+以下循环适用于准入后的全事务模式。round-step复用同一个归并主体，区别是Ledger/Done/最终Consumed都只做一次有界probe，并将next_round保存在progress；未就绪全核一致退出。错误仍先核间汇总，再持久记录RETURN_ERROR，不能通过下次step清掉。
 
 ```text
 InitSocState(); 校验 task/context；所有核采用同一错误分支
@@ -88,6 +96,34 @@ for round_idx in [0,num_comm_rounds):
 core0: 等最后一轮所有 F 的 Consumed==最后 input_bit
        recv_status=COMPLETE
 ```
+
+### 2.3 round-step状态与公平驱动
+
+`AFDReturnProgress`为96B：64B TaskInfo快照，随后`state,next_round,last_input_bit,error_code,reserved[4]`。每个物理slot由A的单recv stream独占；与另一slot共享归并scratch，不能并发调用两条recv stream。
+
+| 状态 | 本次动作 | 后续状态 |
+| --- | --- | --- |
+| IDLE=0 | start=True快照事务，next_round=0；缺start报STATE_ORDER | RUNNING |
+| RUNNING=1 | Ledger或任一F Done未齐，无payload/credit写，退出供下槽运行 | RUNNING |
+| RUNNING=1 | 验证并归并当前轮，全核读完后发credit、释放Ledger、next_round++ | RUNNING或WAIT_ACK |
+| WAIT_ACK=2 | 最后input_bit保存在progress；仅probe全部F Consumed，不重新读已释放Ledger | 未齐保持；齐则DONE |
+| DONE=3 | start=False且TaskInfo一致为完成no-op；新事务只在Etxn后允许start=True | DONE或RUNNING |
+| ERROR=4 | 保留错误，所有后续step拒绝重置 | 域失败并静止后重新初始化 |
+
+活动事务中重复start报错，不能把start=True放入反复replay的sweep图。DONE后的新start无法仅凭复用的mb/layer编号区别新事务与错误重放，因此调用方必须遵守Etxn后的单次接纳；这不是交替位自动保证的能力。TaskInfo全64B在同事务内保持一致，reserved也必须初始化。
+
+```text
+图外初始化 owner(mode=round-step)，并预分配每个活动slot的稳定输入/输出/TaskInfo
+recv stream: 每槽start=True各一次（不等待整次dispatchSend退出）
+随后循环sweep: step(slot0,start=False) → step(slot1,start=False) → ...
+  未Ledger / 未Done / 未最终ACK：返回后仍服务下槽
+  DONE槽：no-op；ERROR槽：停止接纳新任务，终止域，不能伪完成
+  全部DONE：最后一个sweep事件作为接收完成事件，与各Epub汇合Etxn
+```
+
+图capture可固定同一组活动槽的一个sweep，随后重复replay；progress、TaskInfo、路由、mask、weights和output地址不变。一次sweep不保证全部完成，调用方需要独立驱动循环和总超时；完成检查可在图外读取每槽progress，不能用共享recv_status最后一次写入判断全部槽。recv_status的state 1表示仍进行中、2表示本槽完成、3表示本槽错误；全域错误以各槽sticky progress及发送/F侧状态汇总。不要把status查询排到尚未退出的send stream，不能等待一个槽完成后才服务下一槽。
+
+反例及修复的因果关系见[总体设计§4.5.2](../../a5_async_afd_design.md#452-单-workspace-先算后等的进度证明)。一个等待credit(n)的F所依赖的上一轮已经全F Done；有界sweep会处理该轮并释放credit，不会先等待另一个未完成事务。该逻辑保证不包含执行资源共存、传输可靠性或目标SDK可见性的硬件证明。
 
 两个输入 stage 用 id0/1，输出 id2，控制 id3，读取 metadata 与控制复用只发生在不重叠阶段。所有相同 pipeline 对的 event 使用必须配对；输入 stage 在 V 使用结束后才允许下次 MTE2 覆写，需 V→MTE2 notify/wait。不得只设置 MTE2→V 单向依赖。高层 LocalTensor 仅映射第3节同一裸 UB arena，不另申请 TPipe 隐含空间。
 
@@ -125,7 +161,7 @@ UB级：一次处理一个 token 的 h 个 hidden，h 是128的倍数，`h=128*f
 
 ## 4. Workspace 与内存
 
-业务 workspace=`256+A32(32N_c)`，N_c=8 时512B，含核错误/状态快照，不含独立 RoundLedger。Ledger每槽两bank共128B；持久返回控制数组随Context单独计账。没有 B*H FP32 GM 累加区，没有额外全量返回镜像。
+业务 workspace=`256+A32(32N_c)`，N_c=8 时512B，含核错误/状态快照，不含独立 RoundLedger。Ledger每槽两bank共128B；round-step额外`96*num_slots` B进度状态由host计入budget，共享同一份上述scratch。持久返回控制数组随Context单独计账。没有 B*H FP32 GM 累加区，没有额外全量返回镜像。
 
 通信预留每槽 `C*K*return_stride`；示例 C=32768,K=8,return_stride=15360，预留3.75GiB。实际有效 payload 每完整轮为`有效token*K*2H`，H7168时满轮3.5GiB。B=262144时普通 HBM combined_x=3.5GiB；它不随通信窗口缩小。三者不是同一笔内存。输入 x/topk/weights 的全事务保活由调用者负责，不能按 C 预算它们。
 
@@ -160,7 +196,7 @@ masked token 不读取expert_idx和weights中的无效值，直接输出零；�
 
 ## 9. 本次实现落点（待 CANN/A5 验证）
 
-实现为 `deep_ep/include/deep_ep/impls/afd/combine_recv.hpp`，模板 `<E,N,K,H,HC,NC,Timeout>`，`HC` 为128倍数的 hidden chunk，`NC` 为实际 launch 核数。注册返回区 device 参数采用 `uint8_t* buffer`，地址先按byte定位再转换BF16。反向目录从 `context.reserved_address` 读取 `AFDReturnDirectory/AFDReturnLane`；credit直接复用已有 `store_control` 对 F 的UBMEM控制映射写入，无需额外jetty参数。payload传输仍由combineSend的Hcomm路径完成。
+实现为 `deep_ep/include/deep_ep/impls/afd/combine_recv.hpp`，模板 `<E,N,K,H,HC,NC,Timeout,RoundStep>`，`HC` 为128倍数的 hidden chunk，`NC` 为实际 launch 核数。RoundStep只改变外层推进和等待方式，归并数值与双stage主体保持一致。注册返回区 device 参数采用 `uint8_t* buffer`，地址先按byte定位再转换BF16。反向目录从 `context.reserved_address` 读取 `AFDReturnDirectory/AFDReturnLane`；credit直接复用已有 `store_control` 对 F 的UBMEM控制映射写入，无需额外jetty参数。payload传输仍由combineSend的Hcomm路径完成。
 
 实现沿原epilogue的token核间切分，复用RingReducer的批量DMA形状和双stage生命周期；两个输入stage预加载当前/下一route，每stage完成V读取后才允许MTE2 refill。原生rank-partial去重和BF16 count=2快捷归约不适用于逐route权重语义，数值primitive依第2节改为FP32固定K顺序乘加、最后一次BF16转换。路由预检按核分配token，K-wide metadata一次DMA入UB，汇总后才输出。无整轮FP32 GM镜像。
 

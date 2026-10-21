@@ -62,6 +62,9 @@ InitSocState(); 全核读一致Active gate
 NOP/ABORT -> 在尚未开始任何同步/搬运前统一返回
 CONTROL -> core0置INPUT_READY，其他核走相同结束边界
 WORK:
+  core0校验目录/Entry/Member/Segment范围；按输入与输出坐标各排序一次Segment索引
+  输入相邻区间不得重叠；输出按expert顺序恰好覆盖有效行，再加入padding
+  全核并行预检route/record metadata；汇总全部错误后才允许写任何输出
   按物理row区间分配，每核找到相交Segment
   对每stage最多T条有效route:
     asc_copy_gm2ub_align(route refs，连续段可成批搬运)
@@ -80,7 +83,9 @@ WORK:
   local_join(); 无错误core0置INPUT_READY
 ```
 
-事件id0/1服务record双stage，2/3服务metadata双stage，4/5服务refs双stage；相同方向的事件必须配对回收后重用，至多6个stage ID。SF不连续时沿原asc_set_ub2gm_loop1_stride/asc_copy_ub2gm_align分支，或每pack显式地址拷贝；选择前者，并在每次改变loop stride前结束前次copy，结束后恢复默认loop配置，不能污染后续metadata写。
+事件id0/1服务record双stage，2/3服务metadata双stage，4/5服务refs/SF互不重叠阶段；相同方向的事件必须配对回收后重用。实际copy保持原生`preload → consume → refill`两stage：MTE2→S允许消费，MTE3→MTE2保护record回填，独立MTE3→S保护metadata。上面的顺序表说明数据依赖，不要求每tile全部出站后才加载另一stage。
+
+SF row-major直接随record搬出。column-major时先等本stage hidden的MTE3完成，复用第一条record已失效的hidden区，按32B间隔排放每列T个int16 pack，随后一次`asc_copy_ub2gm_align`发出该列块全部burst。`burst_count=columns`、`burst_len=2*T_actual`、UB源stride=32B、GM目的stride=`2*recv_sf_hidden_stride`；均为950 **C API块头到块头的字节距离**，不是C++ DataCopyPad的gap或32B单位。host保证column token stride=1；尾tile只写实际pack，不触碰padding。UB重排和metadata独立，循环内复用该区前仍等MTE3完成；不新增整片SF HBM镜像。目标SDK重载和非32B burst仍须编译/设备位级验证。
 
 ## 3. 两级Tiling与UB
 
@@ -119,7 +124,9 @@ UB偏移严格按表顺序A32累加；stage入站完成后才能读，出站完�
 
 ## 4. Workspace与输出容量
 
-本算子临时workspace=`A32(32N_r)+256`：每核错误/完成报告32B以及负责人广播256B；采用原local SyncAll所需平台workspace另从runtime独立返回。N_r=8时业务scratch512B。
+令`S_cap=min(L*R,Q)`，因为每个合法非空Segment至少贡献一行且表上限LR。临时workspace=`A32(32N_r)+256+2*A32(4*S_cap)`：前半为每核错误/完成报告及负责人广播；后半为两份uint32索引，core0进行底向上归并排序，原Active不变。输入排序键为(lane,expert,route_begin)，检查相邻区间；输出键为(expert,dst_row_begin)，验证连续有效行和padding。支持Entry内任意Segment顺序、多段同lane/expert以及跨核区间，不靠重新约束调用者消除校验。
+
+Segment区间验证由O(S²+R*S)降为O(S log S+R)，保留输出前验证语义。core0仍有目录、Entry和Member检查，不能把本改动称为“全部并行预检”。索引只有元数据，无hidden；N_r=8、S_cap=32768时业务scratch为262656B，其中新增256KiB，host计入memory budget。combineRecv的独立scratch仍为`256+A32(32N_c)`。SyncAll的工具链/runtime资源另行核验。
 
 显式输出：recv_x=`Q_alloc*X`，recv_sf=`storage_span(sf_shape,strides)*2`，recv_src_metadata=`16Q_alloc`。SF span=`(Q_alloc-1)*stride0+(num_sf_packs-1)*stride1+1`，任一维为0时0；不能按numel低估带padding stride的storage。Q_alloc32768,H7168：FP8 x224MiB，BF16 x448MiB，metadata0.5MiB；FP8 S224且紧凑布局sf7MiB。它们是计算workspace组成，不是额外通信payload复制。
 
@@ -127,7 +134,7 @@ buffer、route表、Active是已有输入分配，本函数不再分配。只物
 
 ## 5. 性能优化
 
-复用原多stage搬运；按Segment连续route批读，减少重复histogram。一个record命中多个专家可能在不同片重复本地读取，这是单Q workspace代价；不为此缓存整轮展开。随着Q增大对比gather有效带宽和GMM效率；不能扩大UB token stage挤掉SF/metadata事件。
+复用原多stage搬运；按Segment连续route批读，减少重复histogram。当前仍按专家route读取record：同片不同专家的重复record也可能再次从F本地HBM读取，尚未恢复原生“读一次record后循环topk扇出”。跨卡rank去重不受影响；不能将同片重复读取全部解释为分片必然代价。后续可用有界片内(lane,record)索引整理目的行后恢复扇出，但须重新核算元数据/UB及metadata写回生命周期，不引入整轮hidden缓存。本项是明确的可选性能优化，实际收益待profiling，不能记为必须上卡才能确认是否存在的问题。
 
 ## 6. Kernel实现与精度
 
