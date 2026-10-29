@@ -1,0 +1,6 @@
+native/** text eol=lf
+# Preserve upstream mixed line endings and recognize CRLF in whitespace checks.
+vendor/** -text whitespace=cr-at-eol
+op_kernel/** text eol=lf
+source_manifest.json text eol=lf
+README.md text eol=lf

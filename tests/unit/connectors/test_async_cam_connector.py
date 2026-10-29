@@ -949,7 +949,7 @@ def test_async_factory_injects_context_only_into_cam_connector():
     with pytest.raises(RuntimeError, match="not bound"):
         context.borrow()
 
-    with pytest.raises(TypeError, match="requires a CAMAsyncAFDConnector"):
+    with pytest.raises(TypeError, match="requires an async CAM connector"):
         AFDConnectorFactory.create_connector(
             0,
             0,

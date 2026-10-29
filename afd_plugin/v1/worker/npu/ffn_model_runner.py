@@ -26,7 +26,7 @@ from afd_plugin.compat.npu.profiler import (
     step_afd_npu_profiler,
     stop_afd_npu_profiler,
 )
-from afd_plugin.config import AFD_ASYNC_CONNECTOR, AFDConfig, parse_afd_config
+from afd_plugin.config import AFD_ASYNC_CONNECTORS, AFDConfig, parse_afd_config
 from afd_plugin.connectors import (
     AFDConnectorFactory,
     AFDControlPayload,
@@ -38,6 +38,10 @@ from afd_plugin.connectors import (
 from afd_plugin.connectors.npu.async_cam import (
     AFDAsyncTransferState,
     CAMAsyncAFDConnector,
+)
+from afd_plugin.connectors.npu.async_cam_megamoe import (
+    AFD_MEGAMOE_GROUP_NAME,
+    AsyncCamMegaMoeConnector,
 )
 from afd_plugin.distributed.afd_process_group import ProcessGroupRendezvousContext
 from afd_plugin.envs import async_cam_layered_gmm_enabled
@@ -53,6 +57,7 @@ from afd_plugin.v1.worker.cuda_graph import (
     make_ffn_graph_key,
 )
 from afd_plugin.v1.worker.ffn_model_runner import _set_moe_layer_index
+from afd_plugin.v1.worker.npu.async_cam_megamoe import MegaMoeLayeredExecutor
 from afd_plugin.v1.worker.npu.async_cam_startup import (
     AsyncCamStartupCoordinator,
     AsyncCamStartupSpec,
@@ -89,7 +94,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         local_rank = int(device.index)
         rendezvous_context = (
             ProcessGroupRendezvousContext()
-            if afd_config.connector == AFD_ASYNC_CONNECTOR
+            if afd_config.connector in AFD_ASYNC_CONNECTORS
             else None
         )
         if rendezvous_context is None:
@@ -106,7 +111,9 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             )
         self._async_cam_startup: AsyncCamStartupCoordinator | None = None
         if rendezvous_context is not None:
-            assert isinstance(self.connector, CAMAsyncAFDConnector)
+            assert isinstance(
+                self.connector, (CAMAsyncAFDConnector, AsyncCamMegaMoeConnector)
+            )
             self._async_cam_startup = AsyncCamStartupCoordinator(
                 self.connector,
                 rendezvous_context,
@@ -117,10 +124,18 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                     hidden_size=vllm_config.model_config.hf_config.hidden_size,
                     topk=vllm_config.model_config.hf_config.num_experts_per_tok,
                     activation_dtype=vllm_config.model_config.dtype,
+                    **(
+                        {
+                            "group_name": AFD_MEGAMOE_GROUP_NAME,
+                            "prepare_after_init": True,
+                        }
+                        if isinstance(self.connector, AsyncCamMegaMoeConnector)
+                        else {}
+                    ),
                 ),
             )
         if (
-            isinstance(self.connector, CAMAsyncAFDConnector)
+            isinstance(self.connector, (CAMAsyncAFDConnector, AsyncCamMegaMoeConnector))
             and self.afd_config.compute_gate_on_attention
             and not vllm_config.use_v2_model_runner
         ):
@@ -137,6 +152,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         self._is_shutdown = False
         self._layered_gmm_requested = async_cam_layered_gmm_enabled()
         self._layered_executor: AsyncCAMW4A8Executor | None = None
+        self._megamoe_executor: MegaMoeLayeredExecutor | None = None
         self._async_cam_ffn_graph_enabled = (
             isinstance(self.connector, CAMAsyncAFDConnector)
             and not self.model_config.enforce_eager
@@ -151,9 +167,40 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         return parse_afd_config(vllm_config, expected_role="ffn")
 
     def initialize_afd_connector(self) -> None:
+        if isinstance(self.connector, AsyncCamMegaMoeConnector):
+            self.connector.init_afd_connector()
+            self._initialize_megamoe_executor()
+            return
         if self._layered_executor is None:
             self._initialize_layered_executor()
         self.connector.init_afd_connector()
+
+    def _initialize_megamoe_executor(self) -> None:
+        if self._megamoe_executor is not None:
+            return
+        connector = cast(AsyncCamMegaMoeConnector, self.connector)
+        layers, reason = self.model.get_async_cam_w4a8_layers()
+        if not layers:
+            raise ValueError(f"MegaMoE W4A8 weight extraction failed: {reason}")
+        if tuple(sorted(layer.layer_idx for layer in layers)) != tuple(
+            _ffn_layer_indices(self)
+        ):
+            raise ValueError("MegaMoE weights do not cover remote MoE layer IDs")
+        self._megamoe_executor = MegaMoeLayeredExecutor(layers, connector.static_config)
+        connector.validate_ffn_resources(
+            self._megamoe_executor.layer_ids,
+            tuple(
+                (layer.swiglu_limit, layer.routed_scaling_factor) for layer in layers
+            ),
+        )
+
+    def drain_megamoe_work(self) -> None:
+        if (
+            isinstance(self.connector, AsyncCamMegaMoeConnector)
+            and self._megamoe_executor is not None
+            and self.connector.context is not None
+        ):
+            self._megamoe_executor.drain(self.connector.context)
 
     def _initialize_layered_executor(self) -> None:
         reason = "switch disabled"
@@ -251,6 +298,13 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 "AFD connector",
             )
         step_afd_npu_profiler(self.prof)
+        if isinstance(self.connector, AsyncCamMegaMoeConnector):
+            if self._megamoe_executor is None or self.connector.context is None:
+                raise RuntimeError(
+                    "MegaMoE executor/context must be ready before starting the daemon"
+                )
+            self._megamoe_executor.submit(self.connector.context)
+            return None
         if self._async_cam_ffn_graph_enabled:
             connector = cast(CAMAsyncAFDConnector, self.connector)
             graph = self._async_cam_ffn_graph
@@ -284,6 +338,13 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
 
     def prepare_async_cam_ffn_startup(self) -> FFNStartupPlan:
         """Prepare the executor and select eager or one FULL graph."""
+        if isinstance(self.connector, AsyncCamMegaMoeConnector):
+            try:
+                self._initialize_megamoe_executor()
+            except Exception as exc:
+                self.connector.abort_domain(str(exc))
+                raise
+            return FFNStartupPlan(use_graph=False)
         if self._layered_executor is None:
             self._initialize_layered_executor()
         if not self._async_cam_ffn_graph_enabled:

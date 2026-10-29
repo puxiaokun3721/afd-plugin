@@ -9,7 +9,11 @@
       "afd_async_combine_send",
       "afd_async_combine_recv",
       "grouped_matmul_swiglu_quant_v2_layered",
-      "grouped_matmul_layered"
+      "grouped_matmul_layered",
+      "afd_mega_moe_dispatch_send",
+      "afd_mega_moe_scheduler",
+      "afd_mega_moe_ffn",
+      "afd_mega_moe_combine_recv"
     ],
     "ascend950": [
       "a2e",
@@ -39,6 +43,18 @@
       "requires_shmem": false
     },
     "grouped_matmul_layered": {
+      "requires_shmem": false
+    },
+    "afd_mega_moe_dispatch_send": {
+      "requires_shmem": false
+    },
+    "afd_mega_moe_scheduler": {
+      "requires_shmem": false
+    },
+    "afd_mega_moe_ffn": {
+      "requires_shmem": false
+    },
+    "afd_mega_moe_combine_recv": {
       "requires_shmem": false
     }
   }

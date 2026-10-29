@@ -46,6 +46,16 @@ endif()
 # compile_ascendc_all_ops_so.py via --compile-options). The current source dir
 # is added so op_host sources resolve the ../op_kernel/ tiling headers.
 set(CODE_GEN_COMPILE_OPTS -I${CMAKE_CURRENT_SOURCE_DIR})
+set(AFD_MEGA_MOE_COMMON "${CMAKE_CURRENT_SOURCE_DIR}/../afd_mega_moe_common")
+if(EXISTS "${AFD_MEGA_MOE_COMMON}/include")
+    set(CMAKE_CXX_STANDARD 17)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    include_directories("${AFD_MEGA_MOE_COMMON}/include" "${AFD_MEGA_MOE_COMMON}/op_host")
+    list(APPEND CODE_GEN_COMPILE_OPTS
+        -std=c++17
+        -I${AFD_MEGA_MOE_COMMON}/include
+        -I${AFD_MEGA_MOE_COMMON}/op_host)
+endif()
 if(DEFINED ASCEND_COMPUTE_UNIT AND "${ASCEND_COMPUTE_UNIT}" MATCHES "ascend950")
     add_definitions(-DAFD_TILING_HAS_COMM_ENGINE=1)
     list(APPEND CODE_GEN_COMPILE_OPTS -DAFD_TILING_HAS_COMM_ENGINE=1)

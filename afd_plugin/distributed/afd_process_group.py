@@ -22,6 +22,9 @@ from torch.distributed.rendezvous import rendezvous
 from vllm.distributed import parallel_state
 from vllm.utils.torch_utils import is_torch_equal_or_newer
 
+ASYNC_CAM_PROTOCOL_GROUPS = ("afd_async_cam", "afd_async_cam_megamoe_v1")
+PROTOCOL_HANDSHAKE_TIMEOUT = timedelta(minutes=5)
+
 
 class ProcessGroupRendezvousContext:
     """Borrow the Store and process group created by one CAM rendezvous."""
@@ -89,6 +92,18 @@ def create_hccl_process_group_options(
     return options
 
 
+def validate_afd_wire_protocol(
+    store: Store, *, rank: int, world_size: int, protocol: str
+) -> None:
+    """Reject old/new CAM mixtures on all ranks before constructing HCCL."""
+    announcements = PrefixStore("afd_wire_protocol", store)
+    announcements.set(f"rank/{rank}", protocol)
+    keys = [f"rank/{peer}" for peer in range(world_size)]
+    announcements.wait(keys, PROTOCOL_HANDSHAKE_TIMEOUT)
+    if any(announcements.get(key).decode() != protocol for key in keys):
+        raise RuntimeError("AFD ranks selected incompatible CAM wire protocols")
+
+
 def init_afd_process_group(
     *,
     backend: str,
@@ -115,6 +130,10 @@ def init_afd_process_group(
     )
     store, rank, world_size = next(rendezvous_iterator)
     store.set_timeout(timeout)
+    if group_name in ASYNC_CAM_PROTOCOL_GROUPS:
+        validate_afd_wire_protocol(
+            store, rank=rank, world_size=world_size, protocol=group_name
+        )
     if on_rendezvous is not None:
         on_rendezvous(store)
     prefixed_store = PrefixStore(group_name, store)

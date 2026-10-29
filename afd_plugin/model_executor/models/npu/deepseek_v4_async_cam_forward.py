@@ -22,6 +22,7 @@ from vllm_ascend.models import deepseek_v4 as native
 from afd_plugin.connectors import AFDTransferContext, AFDTransferMetadata
 from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
 from afd_plugin.model_executor.models.npu.async_cam_layout import (
+    MEGAMOE_ACTUAL_TOKENS_KEY,
     AsyncMoeUbatchMetadata,
     CAMDispatchLayout,
     CAMDispatchPayload,
@@ -208,6 +209,12 @@ def run_async_moe_ubatch_forward(
                 topk_ids,
                 None,
                 use_sequence_parallel=metadata.use_sequence_parallel,
+                actual_tokens=(
+                    metadata.stages[stage_idx].actual_tokens
+                    if MEGAMOE_ACTUAL_TOKENS_KEY
+                    in (parent_context.additional_kwargs or {})
+                    else None
+                ),
             )
         stage_shared_outputs[stage_idx] = (
             layer.mlp.shared_experts(stage_hidden)
@@ -236,6 +243,7 @@ def run_async_moe_ubatch_forward(
             AFDTransferContext(metadata=transfer_metadata),
             topk_weights=dispatch.topk_weights,
             topk_ids=dispatch.topk_ids,
+            token_mask=dispatch.token_mask,
         )
         stage_dispatch_layouts[stage_idx] = dispatch.layout
         stage_dispatch_refs[stage_idx] = dispatch.hidden_states

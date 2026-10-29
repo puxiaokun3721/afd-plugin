@@ -287,6 +287,10 @@ the same four tests, and reports failures and process cleanup.
 
 ## NPU async CAM smoke test
 
+For the A3 DeepSeek V4 MegaMoE prefill scenario, including its native reference
+schema and launch commands, see the
+[DeepSeek V4 E2E guide](models/deepseek_v4_flash/README.md).
+
 This separate test still reads `AFD_E2E_DEVICES`. It uses four NPUs: the first
 two for Attention TP=2, and the last two for FFN DP=2/TP=1. It sends one
 prompt and requests 32 tokens. It does not run GSM8K.

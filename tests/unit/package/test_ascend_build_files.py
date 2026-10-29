@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import runpy
@@ -276,6 +277,10 @@ def _run_select_ops(*args: str) -> subprocess.CompletedProcess[str]:
                 "afd_async_combine_recv",
                 "grouped_matmul_swiglu_quant_v2_layered",
                 "grouped_matmul_layered",
+                "afd_mega_moe_dispatch_send",
+                "afd_mega_moe_scheduler",
+                "afd_mega_moe_ffn",
+                "afd_mega_moe_combine_recv",
             ],
         ),
         ("ascend950", ["a2e", "e2a"]),
@@ -321,3 +326,65 @@ def test_select_ops_drops_shmem_operators_when_shmem_missing():
 
     assert select_ops.resolve(registry, ["a2e", "e2a"], False, None) == ["e2a"]
     assert select_ops.resolve(registry, ["a2e", "e2a"], True, None) == ["a2e", "e2a"]
+
+
+@pytest.mark.parametrize(
+    "suffix", ["dispatch_send", "scheduler", "ffn", "combine_recv"]
+)
+def test_megamoe_a3_manifest_exports_complete_custom_operator(suffix: str):
+    root = Path(__file__).resolve().parents[3]
+    kernels = root / "csrc/npu/ascend_kernels"
+    registry = json.loads((kernels / "operator_registry.json").read_text())
+    operator = f"afd_mega_moe_{suffix}"
+    assert operator in registry["soc_versions"]["ascend910_93"]
+    assert operator not in registry["soc_versions"]["ascend950"]
+    assert not registry["operator_meta"][operator]["requires_shmem"]
+    for relative in (
+        f"op_host/{operator}.cpp",
+        f"op_kernel/{operator}.cpp",
+        f"op_api/aclnn_{operator}.h",
+        f"op_api/aclnn_{operator}.cpp",
+    ):
+        assert (kernels / operator / relative).is_file(), relative
+
+
+def test_megamoe_common_tree_stays_outside_registered_kernel_sources():
+    root = Path(__file__).resolve().parents[3]
+    kernels = root / "csrc/npu/ascend_kernels"
+    registry = json.loads((kernels / "operator_registry.json").read_text())
+    assert "afd_mega_moe_common" not in registry["operator_meta"]
+    script = (root / "csrc/npu/scripts/compile_ascend_proj.sh").read_text()
+    assert 'cp -R "$src_dir/afd_mega_moe_common" "$dst_dir/"' in script
+    kernel_cmake = (kernels / "cmake_files/op_kernel/CMakeLists.txt").read_text()
+    assert "${CMAKE_CURRENT_SOURCE_DIR}/../afd_mega_moe_common" in kernel_cmake
+    assert "-I${AFD_MEGA_MOE_COMMON}/native/mc2/common/op_kernel" in kernel_cmake
+    assert (
+        "-I${AFD_MEGA_MOE_COMMON}/native/mc2/mega_moe/op_kernel/arch22" in kernel_cmake
+    )
+    assert "-I${AFD_MEGA_MOE_COMMON}/vendor/catlass/include" in kernel_cmake
+    for relative in (
+        "include/afd_mega_moe/abi.h",
+        "include/afd_mega_moe/tiling.h",
+        "op_host/afd_mega_moe_host.h",
+        "source_manifest.json",
+    ):
+        assert (kernels / "afd_mega_moe_common" / relative).is_file(), relative
+    binding_cmake = (root / "csrc/npu/pybind/CMakeLists.txt").read_text()
+    assert "torch_binding_mega_moe.cpp" in binding_cmake
+    assert "AFD_HAS_MEGA_MOE=1" in binding_cmake
+
+
+def test_megamoe_source_manifest_matches_packaged_bytes():
+    root = Path(__file__).resolve().parents[3]
+    common = root / "csrc/npu/ascend_kernels/afd_mega_moe_common"
+    manifest = json.loads((common / "source_manifest.json").read_text(encoding="utf-8"))
+    entries = manifest["sources"] + manifest["adapters"] + manifest["licenses"]
+    for entry in entries:
+        path = (common / entry["path"]).resolve()
+        assert path.is_relative_to(common), entry["path"]
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == entry["sha256"], entry[
+            "path"
+        ]
+    for entry in manifest["sources"]:
+        if not entry["modified"]:
+            assert entry["source_sha256"] == entry["sha256"], entry["path"]

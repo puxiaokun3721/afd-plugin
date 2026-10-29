@@ -1,0 +1,232 @@
+{
+  "schema_version": "afd-knowledge-audit-export.v1",
+  "export_metadata": {
+    "kind": "sanitized-portable-export",
+    "original_file_sha256": "f6f0d258c85552ca4a16ec17f2ad48758df309cfd7860b7e26c314d1e7a47344",
+    "original_schema_version": "cannbot-knowledge-search.v3",
+    "is_original_immutable_receipt": false,
+    "redactions": [
+      {
+        "replacement": "<KNOWLEDGE_ROOT>",
+        "description": "Replaces the original machine-specific knowledge checkout root; remaining card paths are relative to that root."
+      },
+      {
+        "replacement": "<AUDIT_ROOT>",
+        "description": "Replaces the original machine-specific receipt directory; remaining filenames identify this directory."
+      }
+    ],
+    "verification_note": "This portable export preserves query and card provenance but is not the original receipt. Its original file SHA-256 identifies the separately retained local original. Regenerate receipts and retrieval state using the knowledge tools in the target environment before claiming an audit-chain result."
+  },
+  "exported_document": {
+    "schema_version": "cannbot-knowledge-search.v3",
+    "knowledge_root": "<KNOWLEDGE_ROOT>",
+    "knowledge_commit": "b82acf8cb04dfe4850eeacb2016f189d36cfe6a2",
+    "knowledge_dirty": false,
+    "request": {
+      "query": "SyncAll",
+      "decision": "local-crosscore",
+      "match": "literal",
+      "domain": "ops",
+      "technology": "ascendc",
+      "profile": "apis",
+      "task": null,
+      "tags": [],
+      "platforms": [
+        "a3"
+      ],
+      "include_unlocated": false,
+      "include_shared": false,
+      "source_technology": null,
+      "target_technology": null,
+      "status": "stable",
+      "filters": {
+        "domain": "ops",
+        "technology": "ascendc",
+        "profile": "apis",
+        "task": null,
+        "tags": [],
+        "platforms": [
+          "a3"
+        ],
+        "include_unlocated": false,
+        "include_shared": false,
+        "source_technology": null,
+        "target_technology": null,
+        "status": "stable"
+      },
+      "limit": 1
+    },
+    "request_sha256": "54c6b4d816948a696ca6478e852128b812d168aab7c664bde4287180a1bb4f1c",
+    "index": {
+      "schema_version": "cannbot-knowledge-index.v1",
+      "index_version": 3,
+      "content_fingerprint": "704118fcd54d71d02ff3efbbac85b6502288c03a1ee6121b65b11d2686e5edf6",
+      "governance_fingerprint": "f5b2aca18eca27003166e8306c83b99cc74cf665656c7ade6ea1eb54433331be",
+      "card_count": 8066,
+      "posting_count": 5415252,
+      "built_repository_state": {
+        "commit": "b82acf8cb04dfe4850eeacb2016f189d36cfe6a2",
+        "dirty": false
+      },
+      "query_repository_state": {
+        "commit": "b82acf8cb04dfe4850eeacb2016f189d36cfe6a2",
+        "dirty": false
+      }
+    },
+    "result": {
+      "schema_version": "knowledge-search.v5",
+      "request_sha256": "54c6b4d816948a696ca6478e852128b812d168aab7c664bde4287180a1bb4f1c",
+      "request": {
+        "query": "SyncAll",
+        "decision": "local-crosscore",
+        "match": "literal",
+        "domain": "ops",
+        "technology": "ascendc",
+        "profile": "apis",
+        "task": null,
+        "tags": [],
+        "platforms": [
+          "a3"
+        ],
+        "include_unlocated": false,
+        "include_shared": false,
+        "source_technology": null,
+        "target_technology": null,
+        "status": "stable",
+        "filters": {
+          "domain": "ops",
+          "technology": "ascendc",
+          "profile": "apis",
+          "task": null,
+          "tags": [],
+          "platforms": [
+            "a3"
+          ],
+          "include_unlocated": false,
+          "include_shared": false,
+          "source_technology": null,
+          "target_technology": null,
+          "status": "stable"
+        },
+        "limit": 1
+      },
+      "query": "SyncAll",
+      "match": "literal",
+      "filters": {
+        "domain": "ops",
+        "technology": "ascendc",
+        "profile": "apis",
+        "task": null,
+        "tags": [],
+        "platforms": [
+          "a3"
+        ],
+        "include_unlocated": false,
+        "include_shared": false,
+        "source_technology": null,
+        "target_technology": null,
+        "status": "stable"
+      },
+      "limit": 1,
+      "count": 1,
+      "index": {
+        "schema_version": "cannbot-knowledge-index.v1",
+        "index_version": 3,
+        "content_fingerprint": "704118fcd54d71d02ff3efbbac85b6502288c03a1ee6121b65b11d2686e5edf6",
+        "governance_fingerprint": "f5b2aca18eca27003166e8306c83b99cc74cf665656c7ade6ea1eb54433331be",
+        "card_count": 8066,
+        "posting_count": 5415252,
+        "built_repository_state": {
+          "commit": "b82acf8cb04dfe4850eeacb2016f189d36cfe6a2",
+          "dirty": false
+        },
+        "query_repository_state": {
+          "commit": "b82acf8cb04dfe4850eeacb2016f189d36cfe6a2",
+          "dirty": false
+        }
+      },
+      "results": [
+        {
+          "rank": 1,
+          "score": 9.6,
+          "match_basis": "literal",
+          "path": "ops/ascendc/apis/simd_api/basic_api/sync_control/inter_core_sync/sync_all",
+          "local_path": "<KNOWLEDGE_ROOT>/knowledge/ops/ascendc/apis/simd_api/basic_api/sync_control/inter_core_sync/sync_all.md",
+          "card_lines": 181,
+          "card_sha256": "4a92f885ef2760bb9e5e38de9dfe14515715056cc31968dce5b32414f1bd21ce",
+          "title": "SyncAll",
+          "description": "核间同步控制接口，支持硬件同步（全核同步）和软件同步（通过全局内存轮询指定核数同步）两种模式。",
+          "domain": "ops",
+          "technology": "ascendc",
+          "type": "API",
+          "profile": "apis",
+          "status": "stable",
+          "trust_tier": "unverified",
+          "platforms": [
+            "950",
+            "a2",
+            "a3",
+            "310p",
+            "910",
+            "kirin_x90",
+            "kirin_9030"
+          ],
+          "tags": [
+            "task.lookup",
+            "topic.implementation.api_layer.basic_api",
+            "topic.implementation.synchronization"
+          ],
+          "sources": [
+            {
+              "resource": "cann-docs-raw/asc-devkit/docs/zh/api/SIMD-API/basic_api/sync_control/inter_core_sync/SyncAll.md",
+              "role": "primary"
+            }
+          ],
+          "created_at": "2026-08-18T14:51:00Z",
+          "updated_at": "2026-10-10T04:14:14Z"
+        }
+      ],
+      "hits": [
+        {
+          "rank": 1,
+          "score": 9.6,
+          "match_basis": "literal",
+          "path": "ops/ascendc/apis/simd_api/basic_api/sync_control/inter_core_sync/sync_all",
+          "local_path": "<KNOWLEDGE_ROOT>/knowledge/ops/ascendc/apis/simd_api/basic_api/sync_control/inter_core_sync/sync_all.md",
+          "card_lines": 181,
+          "card_sha256": "4a92f885ef2760bb9e5e38de9dfe14515715056cc31968dce5b32414f1bd21ce",
+          "title": "SyncAll",
+          "description": "核间同步控制接口，支持硬件同步（全核同步）和软件同步（通过全局内存轮询指定核数同步）两种模式。",
+          "domain": "ops",
+          "technology": "ascendc",
+          "type": "API",
+          "profile": "apis",
+          "status": "stable",
+          "trust_tier": "unverified",
+          "platforms": [
+            "950",
+            "a2",
+            "a3",
+            "310p",
+            "910",
+            "kirin_x90",
+            "kirin_9030"
+          ],
+          "tags": [
+            "task.lookup",
+            "topic.implementation.api_layer.basic_api",
+            "topic.implementation.synchronization"
+          ],
+          "sources": [
+            {
+              "resource": "cann-docs-raw/asc-devkit/docs/zh/api/SIMD-API/basic_api/sync_control/inter_core_sync/SyncAll.md",
+              "role": "primary"
+            }
+          ],
+          "created_at": "2026-08-18T14:51:00Z",
+          "updated_at": "2026-10-10T04:14:14Z"
+        }
+      ]
+    }
+  }
+}

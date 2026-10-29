@@ -4,6 +4,9 @@ from types import SimpleNamespace
 
 import pytest
 
+pytest.importorskip("torch")
+pytest.importorskip("vllm")
+
 from afd_plugin.config import AFDConfig
 from afd_plugin.connectors import (
     AFDA2FTransferPayload,

@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
+import statistics
 import time
 from pathlib import Path
 
@@ -19,6 +21,9 @@ from tests.e2e.models.deepseek_v4_flash.config import (
     DSV4_REQUEST_TIMEOUT_S,
 )
 
+PREFILL_MAX_TOKENS = 1
+FIRST_TOKEN_LOGPROB_ATOL = 0.05
+
 
 def evaluate_completions(
     *,
@@ -26,6 +31,8 @@ def evaluate_completions(
     model: str,
     output_path: Path,
     check_answer: bool = True,
+    prefill_only: bool = False,
+    reference_path: Path | None = None,
 ) -> None:
     """Run the ten concurrent requests and check every response.
 
@@ -49,6 +56,23 @@ def evaluate_completions(
         for index in range(DSV4_CONCURRENT_REQUESTS)
     ]
 
+    reference_cases: dict[str, dict] = {}
+    if prefill_only:
+        if reference_path is None:
+            raise ValueError("prefill accuracy requires a native reference file")
+        reference = json.loads(reference_path.read_text(encoding="utf-8"))
+        if reference["quantization"] != "W4A8-per-channel":
+            raise ValueError(
+                "prefill reference must use the same per-channel W4A8 math"
+            )
+        if not reference["model_revision"]:
+            raise ValueError("prefill reference must identify its checkpoint revision")
+        reference_cases = {case["prompt"]: case for case in reference["cases"]}
+        if set(reference_cases) != {item["prompt"] for item in results}:
+            raise ValueError(
+                "prefill reference must cover exactly these request prompts"
+            )
+
     async def request(client: httpx.AsyncClient, item: dict) -> None:
         item["started_at"] = time.monotonic()
         try:
@@ -58,7 +82,10 @@ def evaluate_completions(
                     "model": model,
                     "messages": [{"role": "user", "content": item["prompt"]}],
                     "temperature": 0.0,
-                    "max_tokens": DSV4_COMPLETION_MAX_TOKENS,
+                    "max_tokens": PREFILL_MAX_TOKENS
+                    if prefill_only
+                    else DSV4_COMPLETION_MAX_TOKENS,
+                    **({"logprobs": True, "top_logprobs": 5} if prefill_only else {}),
                     "chat_template_kwargs": {"thinking": False},
                 },
             )
@@ -67,20 +94,26 @@ def evaluate_completions(
             item["response_body"] = response.text
             response.raise_for_status()
             item["response"] = response.json()
-            validate_response(item["response"], check_answer=check_answer)
+            if prefill_only:
+                validate_prefill_response(
+                    item["response"], reference_cases[item["prompt"]]
+                )
+            else:
+                validate_response(item["response"], check_answer=check_answer)
             expected = (
                 DSV4_PROMPT_FIRST_OPERAND + item["index"] + DSV4_PROMPT_SECOND_OPERAND
             )
             content = item["response"]["choices"][0]["message"]["content"].strip()
-            if check_answer and content != str(expected):
+            if check_answer and not prefill_only and content != str(expected):
                 raise RuntimeError(
                     f"wrong answer: expected {expected}, got {content!r}"
                 )
             del item["error"]
-        except (httpx.HTTPError, ValueError, RuntimeError) as exc:
+        except (httpx.HTTPError, ValueError, RuntimeError, KeyError, TypeError) as exc:
             item["error"] = f"{type(exc).__name__}: {exc}"
         finally:
             item["finished_at"] = time.monotonic()
+            item["latency_seconds"] = item["finished_at"] - item["started_at"]
 
     async def run_requests() -> None:
         # All requests are scheduled before yielding. Async socket operations
@@ -112,6 +145,13 @@ def evaluate_completions(
         content = item["response"]["choices"][0]["message"]["content"]
         print(f"Request {item['index'] + 1}: {item['prompt']} -> {content}")
     print(f"Concurrent completions: {len(results)}/{DSV4_CONCURRENT_REQUESTS} passed")
+    if prefill_only:
+        latencies = [item["latency_seconds"] for item in results]
+        print(
+            "First-token HTTP latency seconds: "
+            f"median={statistics.median(latencies):.6f} "
+            f"min={min(latencies):.6f} max={max(latencies):.6f}"
+        )
 
 
 def validate_response(result: dict, *, check_answer: bool = True) -> None:
@@ -133,3 +173,24 @@ def validate_response(result: dict, *, check_answer: bool = True) -> None:
         return
     if finish_reason != "stop":
         raise RuntimeError("did not finish normally")
+
+
+def validate_prefill_response(result: dict, reference: dict) -> None:
+    """Check exactly one generated token and finite same-checkpoint logprob."""
+    validate_response(result, check_answer=False)
+    if result["usage"]["completion_tokens"] != PREFILL_MAX_TOKENS:
+        raise RuntimeError("prefill-only request must generate exactly one token")
+    choice = result["choices"][0]
+    if choice["finish_reason"] not in ("length", "stop"):
+        raise RuntimeError("prefill-only request did not finish normally")
+    token_scores = choice["logprobs"]["content"]
+    if len(token_scores) != 1:
+        raise RuntimeError("prefill-only response must contain one token logprob")
+    actual = token_scores[0]
+    expected_score, actual_score = float(reference["logprob"]), float(actual["logprob"])
+    if not math.isfinite(expected_score) or not math.isfinite(actual_score):
+        raise RuntimeError("non-finite first-token logprob")
+    if actual["token"] != reference["token"]:
+        raise RuntimeError("first-token identity differs from native reference")
+    if abs(actual_score - expected_score) > FIRST_TOKEN_LOGPROB_ATOL:
+        raise RuntimeError("first-token logprob exceeds native-reference tolerance")

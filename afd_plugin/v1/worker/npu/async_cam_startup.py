@@ -42,6 +42,8 @@ class AsyncCamStartupSpec:
     hidden_size: int
     topk: int
     activation_dtype: torch.dtype
+    group_name: str = AFD_ASYNC_CAM_GROUP_NAME
+    prepare_after_init: bool = False
 
     @property
     def attention_dp_size(self) -> int:
@@ -112,14 +114,12 @@ class AsyncCamStartupCoordinator:
         topology = self._spec.topology
         # One startup per fresh CAM rendezvous Store. Exchange host metadata
         # without an HCCL collective, allowing different A/F buffer sizes.
-        bootstrap = PrefixStore(f"{AFD_ASYNC_CAM_GROUP_NAME}/startup", store)
+        bootstrap = PrefixStore(f"{self._spec.group_name}/startup", store)
         if topology.world_rank == 0:
             bootstrap.set("namespace", os.urandom(STARTUP_NONCE_BYTES).hex())
         bootstrap.wait(["namespace"], timedelta(seconds=STARTUP_TIMEOUT_SECONDS))
         namespace = bootstrap.get("namespace").decode()
-        self._store = PrefixStore(
-            f"{AFD_ASYNC_CAM_GROUP_NAME}/startup/{namespace}", store
-        )
+        self._store = PrefixStore(f"{self._spec.group_name}/startup/{namespace}", store)
         return self._store
 
     def _failure_keys(self) -> list[str]:
@@ -327,6 +327,9 @@ class AsyncCamStartupCoordinator:
         if not self._begin("ffn"):
             return
         try:
+            if self._spec.prepare_after_init:
+                self._connector.init_afd_connector()
+                self._get_store()
             plan = prepare()
             if not self._connector.is_initialized:
                 self._connector.init_afd_connector()

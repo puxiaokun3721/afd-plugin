@@ -23,6 +23,7 @@ from afd_plugin.compat.npu import (
     npu_afd_num_ubatches,
 )
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
+from afd_plugin.connectors.npu.async_cam_megamoe import AsyncCamMegaMoeConnector
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
 from afd_plugin.v1.worker.npu.ffn_model_runner import AFDNPUFFNModelRunner
 from afd_plugin.validation import (
@@ -156,6 +157,8 @@ class AFDNPUFFNWorker(NPUWorker):
                         exc_info=True,
                     )
                     return
+                if isinstance(self.model_runner.connector, AsyncCamMegaMoeConnector):
+                    self.model_runner.connector.abort_domain(str(exc))
                 self._ffn_loop_error = exc
                 started_event.set()
                 logger.exception("AFD NPU FFN worker loop failed")
@@ -209,14 +212,20 @@ class AFDNPUFFNWorker(NPUWorker):
             return
 
         torch.npu.set_device(self.device)
-        if isinstance(self.model_runner.connector, CAMAsyncAFDConnector):
+        if isinstance(
+            self.model_runner.connector,
+            (CAMAsyncAFDConnector, AsyncCamMegaMoeConnector),
+        ):
             started_event = self._ffn_loop_started_event
             if started_event is not None:
                 started_event.set()
         while not event.is_set():
             if self.model_runner.connector.control_plane is None:
                 self.model_runner.execute_connector_driven_step()
-                torch.npu.synchronize()
+                if not isinstance(
+                    self.model_runner.connector, AsyncCamMegaMoeConnector
+                ):
+                    torch.npu.synchronize()
                 continue
 
             payload = self.model_runner.connector.control_plane.recv_dp_metadata_list()
@@ -234,6 +243,8 @@ class AFDNPUFFNWorker(NPUWorker):
                 is_graph_replaying=is_graph_replaying,
             )
             torch.npu.synchronize()
+        if isinstance(self.model_runner.connector, AsyncCamMegaMoeConnector):
+            self.model_runner.drain_megamoe_work()
         self._ffn_receiver_drained = True
 
     def raise_ffn_loop_error_if_any(self) -> None:
@@ -250,8 +261,12 @@ class AFDNPUFFNWorker(NPUWorker):
         # work item. Do not destroy its communicator or graph-owned tensors
         # while the worker thread is still using them.
         connector = self.model_runner.connector
+        if isinstance(connector, AsyncCamMegaMoeConnector):
+            connector.request_stop()
         cam_connector = (
-            connector if isinstance(connector, CAMAsyncAFDConnector) else None
+            connector
+            if isinstance(connector, (CAMAsyncAFDConnector, AsyncCamMegaMoeConnector))
+            else None
         )
         thread = self._ffn_thread
         if cam_connector is not None and thread is not None:

@@ -16,10 +16,14 @@ from tests.e2e.models.deepseek_v4_flash.config import (
     DSV4_ASYNC_CAM_SCENARIO,
     DSV4_ATTENTION_RANKS,
     DSV4_FFN_RANKS,
+    DSV4_MEGAMOE_PREFILL_SCENARIO,
 )
 
 
-def build_runner_command(output_path: Path) -> list[str]:
+def build_runner_command(
+    output_path: Path,
+    scenario: str = DSV4_ASYNC_CAM_SCENARIO,
+) -> list[str]:
     if required_env("AFD_E2E_BACKEND") != "npu":
         raise RuntimeError("DSV4 async CAM E2E requires AFD_E2E_BACKEND=npu")
     devices = devices_from_env("AFD_E2E_DEVICES", DSV4_ATTENTION_RANKS + DSV4_FFN_RANKS)
@@ -38,7 +42,15 @@ def build_runner_command(output_path: Path) -> list[str]:
         "--ffn-devices",
         ",".join(devices[DSV4_ATTENTION_RANKS:]),
         "--scenario",
-        DSV4_ASYNC_CAM_SCENARIO,
+        scenario,
+        *(
+            [
+                "--prefill-reference-path",
+                required_env("AFD_NPU_MEGAMOE_PREFILL_REFERENCE"),
+            ]
+            if scenario == DSV4_MEGAMOE_PREFILL_SCENARIO
+            else []
+        ),
         "--served-model-name-prefix",
         "dsv4-flash",
         "--afd-host",
@@ -86,9 +98,11 @@ def build_environment() -> dict[str, str]:
 @pytest.mark.npu
 @pytest.mark.e2e
 @pytest.mark.slow
-@pytest.mark.parametrize("scenario", [DSV4_ASYNC_CAM_SCENARIO])
+@pytest.mark.parametrize(
+    "scenario", [DSV4_ASYNC_CAM_SCENARIO, DSV4_MEGAMOE_PREFILL_SCENARIO]
+)
 def test_deepseek_v4_flash_async_cam(scenario: str, tmp_path: Path) -> None:
     run_runner(
-        build_runner_command(tmp_path / f"{scenario}.json"),
+        build_runner_command(tmp_path / f"{scenario}.json", scenario),
         env=build_environment(),
     )

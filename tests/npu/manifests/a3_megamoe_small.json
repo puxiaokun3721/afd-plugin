@@ -1,0 +1,15 @@
+{
+  "attn_dp_size": 1,
+  "tokens_per_tp": [17, 0],
+  "ffn_ep_size": 2,
+  "local_expert_count": 2,
+  "hidden_size": 1024,
+  "intermediate_size": 512,
+  "topk": 2,
+  "recv_route_capacity": 8,
+  "layer_ids": [2, 4, 7],
+  "layer_order": [7, 2, 7, 4],
+  "mask_stride": 5,
+  "hotspot": true,
+  "swiglu_limit": 1.0
+}

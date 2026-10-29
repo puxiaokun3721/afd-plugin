@@ -13,6 +13,17 @@ set(KERNEL_COMPILE_OPTS)
 # Common options: add current source dir as global header search path
 # (resolves the shared utils/op_kernel headers copied next to the kernels).
 list(APPEND KERNEL_COMPILE_OPTS -I${CMAKE_CURRENT_SOURCE_DIR} -DASCENDC_DUMP=0 --cce-auto-sync=off -Wno-deprecated-declarations -Werror)
+set(AFD_MEGA_MOE_COMMON "${CMAKE_CURRENT_SOURCE_DIR}/../afd_mega_moe_common")
+if(EXISTS "${AFD_MEGA_MOE_COMMON}/include")
+    list(APPEND KERNEL_COMPILE_OPTS
+        -std=c++17
+        -I${AFD_MEGA_MOE_COMMON}
+        -I${AFD_MEGA_MOE_COMMON}/include
+        -I${AFD_MEGA_MOE_COMMON}/op_kernel
+        -I${AFD_MEGA_MOE_COMMON}/native/mc2/common/op_kernel
+        -I${AFD_MEGA_MOE_COMMON}/native/mc2/mega_moe/op_kernel/arch22
+        -I${AFD_MEGA_MOE_COMMON}/vendor/catlass/include)
+endif()
 
 # set custom compile options (single call to avoid overwriting)
 if ("${CMAKE_BUILD_TYPE}x" STREQUAL "Debugx")

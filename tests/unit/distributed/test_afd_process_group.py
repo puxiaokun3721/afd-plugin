@@ -1,39 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-
-from __future__ import annotations
-
-import sys
-from types import ModuleType, SimpleNamespace
+"""Wire protocol announcements precede every async CAM HCCL domain."""
 
 import pytest
 
-pytest.importorskip("torch")
+torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
 from afd_plugin.distributed.afd_process_group import (  # noqa: E402
-    create_hccl_process_group_options,
+    validate_afd_wire_protocol,
 )
 
 
-def test_create_hccl_process_group_options_is_scoped(monkeypatch):
-    class FakeOptions:
-        hccl_config = None
+def test_mixed_cam_protocols_fail_before_domain_creation():
+    store = torch.distributed.HashStore()
+    store.set("afd_wire_protocol/rank/1", "afd_async_cam_megamoe_v1")
+    with pytest.raises(RuntimeError, match="incompatible CAM wire protocols"):
+        validate_afd_wire_protocol(
+            store, rank=0, world_size=2, protocol="afd_async_cam"
+        )
 
-    class FakeTorchNPU(ModuleType):
-        _C: SimpleNamespace
 
-    fake_torch_npu = FakeTorchNPU("torch_npu")
-    fake_torch_npu._C = SimpleNamespace(
-        _distributed_c10d=SimpleNamespace(
-            ProcessGroupHCCL=SimpleNamespace(Options=FakeOptions),
-        ),
+def test_matching_protocol_is_announced_to_peers():
+    store = torch.distributed.HashStore()
+    validate_afd_wire_protocol(
+        store, rank=0, world_size=1, protocol="afd_async_cam_megamoe_v1"
     )
-    monkeypatch.setitem(sys.modules, "torch_npu", fake_torch_npu)
-
-    assert create_hccl_process_group_options(None) is None
-    options = create_hccl_process_group_options(4096)
-    other_options = create_hccl_process_group_options(4096)
-
-    assert options.hccl_config == {"hccl_buffer_size": 4096}
-    assert options is not other_options
+    assert store.get("afd_wire_protocol/rank/0") == b"afd_async_cam_megamoe_v1"

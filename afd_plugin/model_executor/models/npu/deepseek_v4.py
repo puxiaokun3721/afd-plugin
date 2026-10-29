@@ -23,13 +23,18 @@ from vllm.model_executor.layers import fused_moe
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.sequence import IntermediateTensors
 
-from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
+from afd_plugin.config import (
+    AFD_ASYNC_CONNECTORS,
+    AFD_MEGAMOE_CONNECTOR,
+    parse_afd_config,
+)
 from afd_plugin.connectors import (
     AFDExpertRoutingSpec,
     AFDF2ATransferPayload,
 )
 from afd_plugin.model_executor.models.deepseek_v2 import RemoteFFNProxy
 from afd_plugin.model_executor.models.npu.async_cam_layout import (
+    MEGAMOE_ACTUAL_TOKENS_KEY,
     get_async_moe_ubatch_metadata_from_forward_context,
     prepare_cam_dispatch_payload,
     restore_cam_dispatch_output,
@@ -246,11 +251,15 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
             topk_ids,
             None,
             use_sequence_parallel=get_forward_context().flash_comm_v1_enabled,
+            actual_tokens=(get_forward_context().additional_kwargs or {}).get(
+                MEGAMOE_ACTUAL_TOKENS_KEY
+            ),
         )
         output = self._send_and_receive(
             dispatch_payload.hidden_states,
             topk_weights=dispatch_payload.topk_weights,
             topk_ids=dispatch_payload.topk_ids,
+            token_mask=dispatch_payload.token_mask,
         )
         output = restore_cam_dispatch_output(output, dispatch_payload.layout)
         if self.shared_experts is not None:
@@ -328,7 +337,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
             self.self_attn = native.PPMissingLayer()
             _refresh_ascend_fused_moe()
             moe_config = config
-            if afd_config.connector == AFD_ASYNC_CONNECTOR:
+            if afd_config.connector in AFD_ASYNC_CONNECTORS:
                 moe_config = copy(config)
                 # HF validates this public field as int, but pinned native
                 # MoE uses only None to omit shared construction (0 builds a
@@ -416,7 +425,7 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         afd_config = parse_afd_config(vllm_config, validate=False)
         if (
-            afd_config.connector == AFD_ASYNC_CONNECTOR
+            afd_config.connector in AFD_ASYNC_CONNECTORS
             and not afd_config.compute_gate_on_attention
         ):
             raise ValueError(
@@ -645,7 +654,10 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
 
     def get_async_cam_w4a8_layers(self) -> "tuple[list[W4A8LayerWeights], str]":
-        return _extract_async_cam_w4a8_layers(self.model.layers)
+        return _extract_async_cam_w4a8_layers(
+            self.model.layers,
+            require_homogeneous=self.afd_config.connector != AFD_MEGAMOE_CONNECTOR,
+        )
 
     def compute_ffn_output(
         self,
@@ -683,7 +695,7 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
             weights,
             role=self.afd_role,
             attn_owns_gate=bool(self.afd_config.compute_gate_on_attention),
-            attention_shared_experts=self.afd_config.connector == AFD_ASYNC_CONNECTOR,
+            attention_shared_experts=self.afd_config.connector in AFD_ASYNC_CONNECTORS,
         )
         loaded = super().load_weights(role_weights)
         return loaded
@@ -691,6 +703,8 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
 
 def _extract_async_cam_w4a8_layers(
     layers: Iterable[AFDDeepseekV4DecoderLayer],
+    *,
+    require_homogeneous: bool = True,
 ) -> "tuple[list[W4A8LayerWeights], str]":
     """Expose loaded DeepSeek V4 routed-expert weights to the layered executor."""
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -746,9 +760,12 @@ def _extract_async_cam_w4a8_layers(
                 routed_scaling_factor=1.0,
             )
         )
-    # One layered call shares static geometry, quantization, and scaling
-    # across every selectable layer; heterogeneous layers use the legacy path.
-    if any(weight.signature() != weights[0].signature() for weight in weights):
+    # The legacy layered GMM shares one full signature across selectable layers.
+    # MegaMoE keeps activation parameters per layer and its executor validates
+    # every layer's geometry, quantization, scales and dtype before op loading.
+    if require_homogeneous and any(
+        weight.signature() != weights[0].signature() for weight in weights
+    ):
         return [], "heterogeneous W4A8 geometry, quantization or model semantics"
     return weights, ""
 

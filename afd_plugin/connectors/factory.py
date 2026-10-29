@@ -67,10 +67,15 @@ class AFDConnectorFactory:
         role_rank = resolve_role_rank(vllm_config, config)
         if rendezvous_context is not None:
             from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
+            from afd_plugin.connectors.npu.async_cam_megamoe import (
+                AsyncCamMegaMoeConnector,
+            )
 
-            if not issubclass(connector_cls, CAMAsyncAFDConnector):
+            if not issubclass(
+                connector_cls, (CAMAsyncAFDConnector, AsyncCamMegaMoeConnector)
+            ):
                 raise TypeError(
-                    "rendezvous_context requires a CAMAsyncAFDConnector class"
+                    "rendezvous_context requires an async CAM connector class"
                 )
             return connector_cls(
                 rank,
@@ -122,5 +127,10 @@ AFDConnectorFactory.register_connector(
     "CAMAsyncAFDConnector",
 )
 
+AFDConnectorFactory.register_connector(
+    "cam_async_megamoe",
+    "afd_plugin.connectors.npu.async_cam_megamoe",
+    "AsyncCamMegaMoeConnector",
+)
 
 __all__ = ["AFDConnectorFactory"]

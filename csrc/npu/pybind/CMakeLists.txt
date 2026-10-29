@@ -60,8 +60,10 @@ if(AFD_SOC_VERSION STREQUAL "")
   set(AFD_SOC_VERSION "910c")
 endif()
 if(AFD_SOC_VERSION STREQUAL "910c" OR AFD_SOC_VERSION MATCHES "^ascend910_93")
+  target_compile_definitions(afd_plugin_ascend_C PRIVATE AFD_HAS_MEGA_MOE=1)
   target_sources(afd_plugin_ascend_C PRIVATE
-    "${CMAKE_CURRENT_LIST_DIR}/torch_binding_cam_async.cpp")
+    "${CMAKE_CURRENT_LIST_DIR}/torch_binding_cam_async.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/torch_binding_mega_moe.cpp")
 elseif(AFD_SOC_VERSION STREQUAL "950" OR AFD_SOC_VERSION MATCHES "^[Aa]scend950")
   message(STATUS "CAM asynchronous bindings disabled for Ascend 950")
 else()
@@ -75,6 +77,7 @@ target_include_directories(afd_plugin_ascend_C PRIVATE
   "${AFD_NPU_CSRC_DIR}"
   "${AFD_NPU_CSRC_DIR}/pybind/pytorch_extension"
   "${AFD_NPU_CSRC_DIR}/ascend_kernels"
+  "${AFD_NPU_CSRC_DIR}/ascend_kernels/afd_mega_moe_common/include"
   "${TORCH_INCLUDE_DIRS}"
   "${TORCH_NPU_PATH}/include"
   "${ASCEND_HOME_PATH}/include"

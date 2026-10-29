@@ -18,6 +18,11 @@ if TYPE_CHECKING:
 
 AFD_ADDITIONAL_CONFIG_KEY: Final[str] = "afd"
 AFD_ASYNC_CONNECTOR: Final[str] = "CAMAsyncAFDConnector"
+AFD_MEGAMOE_CONNECTOR: Final[str] = "cam_async_megamoe"
+AFD_ASYNC_CONNECTORS: Final[tuple[str, ...]] = (
+    AFD_ASYNC_CONNECTOR,
+    AFD_MEGAMOE_CONNECTOR,
+)
 CAMP2P_CONNECTOR: Final[str] = "CAMP2pAFDConnector"
 AFDRole = Literal["attention", "ffn"]
 
@@ -26,6 +31,7 @@ SUPPORTED_AFD_CONNECTORS: Final[tuple[str, ...]] = (
     "P2pNcclAFDConnector",
     CAMP2P_CONNECTOR,
     AFD_ASYNC_CONNECTOR,
+    AFD_MEGAMOE_CONNECTOR,
 )
 
 _ALIASES: Final[dict[str, str]] = {
@@ -295,7 +301,7 @@ def is_afd_async_dp(vllm_config: VllmConfig) -> bool:
     return (
         config is not None
         and config.async_dp
-        and config.connector == AFD_ASYNC_CONNECTOR
+        and config.connector in AFD_ASYNC_CONNECTORS
     )
 
 
@@ -319,7 +325,7 @@ def validate_afd_config(
             "AFD connector must be one of "
             f"{SUPPORTED_AFD_CONNECTORS!r}, got {config.connector!r}",
         )
-    if config.async_dp and config.connector != AFD_ASYNC_CONNECTOR:
+    if config.async_dp and config.connector not in AFD_ASYNC_CONNECTORS:
         raise ValueError(
             "AFD async mode requires connector='CAMAsyncAFDConnector'",
         )
@@ -344,6 +350,8 @@ def validate_afd_config(
 __all__ = [
     "AFDConfig",
     "AFD_ASYNC_CONNECTOR",
+    "AFD_ASYNC_CONNECTORS",
+    "AFD_MEGAMOE_CONNECTOR",
     "afd_config_from_mapping",
     "AFD_ADDITIONAL_CONFIG_KEY",
     "AFDRole",

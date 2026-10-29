@@ -18,6 +18,7 @@ from vllm.v1.attention.backend import AttentionMetadata
 from afd_plugin.model_executor.npu.async_cam_ubatching import AsyncMoeStage
 
 ASYNC_MOE_UBATCH_METADATA_KEY: Final[str] = "afd_async_moe_ubatch_metadata"
+MEGAMOE_ACTUAL_TOKENS_KEY: Final[str] = "afd_megamoe_actual_tokens"
 ASYNC_MOE_LAYOUT_LOG_ENV: Final[str] = "AFD_ASYNC_MOE_LAYOUT_LOG"
 _TRUE_ENV_VALUES: Final[frozenset[str]] = frozenset({"1", "true", "yes", "on"})
 
@@ -127,6 +128,7 @@ class CAMDispatchPayload:
     topk_ids: torch.Tensor
     router_logits: torch.Tensor | None
     layout: CAMDispatchLayout
+    token_mask: torch.Tensor | None = None
 
 
 def prepare_cam_dispatch_payload(
@@ -136,6 +138,7 @@ def prepare_cam_dispatch_payload(
     router_logits: torch.Tensor | None,
     *,
     use_sequence_parallel: bool,
+    actual_tokens: int | None = None,
 ) -> CAMDispatchPayload:
     """Convert the model token layout to one rank-local CAM payload.
 
@@ -183,6 +186,12 @@ def prepare_cam_dispatch_payload(
             topk_ids=topk_ids,
             router_logits=router_logits,
             layout=layout,
+            token_mask=build_cam_token_mask(
+                parent_tokens,
+                tp_rank * parent_tokens if use_sequence_parallel else 0,
+                actual_tokens,
+                hidden_states.device,
+            ),
         )
 
     local_tokens = (parent_tokens + tp_size - 1) // tp_size
@@ -209,7 +218,24 @@ def prepare_cam_dispatch_payload(
             else _pad_first_dim(router_logits, padded_tokens)[local_token_slice]
         ),
         layout=layout,
+        token_mask=build_cam_token_mask(
+            local_tokens, local_start, actual_tokens, hidden_states.device
+        ),
     )
+
+
+def build_cam_token_mask(
+    local_tokens: int,
+    global_start: int,
+    actual_tokens: int | None,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Mark real source rows from the stage plan, including empty TP shards."""
+    if actual_tokens is None:
+        return None
+    if actual_tokens < 0 or global_start < 0 or local_tokens < 0:
+        raise ValueError("CAM token extents must be nonnegative")
+    return torch.arange(local_tokens, device=device) + global_start < actual_tokens
 
 
 def restore_cam_dispatch_output(

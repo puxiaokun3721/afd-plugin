@@ -27,9 +27,11 @@ from tests.e2e.models.deepseek_v4_flash import config as dsv4_config
 from tests.e2e.models.deepseek_v4_flash.completions import evaluate_completions
 from tests.e2e.models.deepseek_v4_flash.config import (
     DSV4_ASYNC_CAM_SCENARIO,
+    DSV4_ASYNC_SCENARIOS,
     DSV4_ATTENTION_RANKS,
     DSV4_ATTENTION_TP_SIZE,
     DSV4_FFN_RANKS,
+    DSV4_MEGAMOE_PREFILL_SCENARIO,
     DSV4_PROCESS_TERMINATION_TIMEOUT_S,
     DSV4_SCENARIOS,
     DSV4_SYNC_CAMP2P_SCENARIOS,
@@ -317,6 +319,10 @@ def parse_args() -> argparse.Namespace:
         help="JSON file containing the ten concurrent DSV4 requests and responses.",
     )
     parser.add_argument(
+        "--prefill-reference-path",
+        help="Native same-checkpoint first-token reference JSON for MegaMoE accuracy.",
+    )
+    parser.add_argument(
         "--gsm8k-output-path",
         help="Directory or file path where lm-eval writes GSM8K results.",
     )
@@ -462,6 +468,9 @@ def configure_scenario(args: argparse.Namespace) -> None:
             sync_profile.attention_ranks,
             sync_profile.ffn_ranks,
         )
+    scenario_settings[DSV4_MEGAMOE_PREFILL_SCENARIO] = scenario_settings[
+        DSV4_ASYNC_CAM_SCENARIO
+    ]
     baseline, use_graph, enable_dbo, attention_ranks, ffn_ranks = scenario_settings[
         args.scenario
     ]
@@ -472,7 +481,7 @@ def configure_scenario(args: argparse.Namespace) -> None:
     args.num_ffn_ranks = ffn_ranks
     args.tp_size = 1
     active_sync_profile = sync_shape(args.scenario)
-    if args.scenario == DSV4_ASYNC_CAM_SCENARIO:
+    if args.scenario in DSV4_ASYNC_SCENARIOS:
         args.attention_tp_size = DSV4_ATTENTION_TP_SIZE
     elif active_sync_profile is not None:
         args.attention_tp_size = active_sync_profile.attention_tp_size
@@ -551,7 +560,12 @@ def configure_scenario(args: argparse.Namespace) -> None:
             for arg in args.common_vllm_arg
         ):
             args.common_vllm_arg.extend(["--gpu-memory-utilization", "0.8"])
-    if args.scenario == DSV4_ASYNC_CAM_SCENARIO:
+    if args.scenario == DSV4_MEGAMOE_PREFILL_SCENARIO and (
+        not args.prefill_reference_path
+        or not Path(args.prefill_reference_path).is_file()
+    ):
+        raise ValueError("MegaMoE E2E requires an existing --prefill-reference-path")
+    if args.scenario in DSV4_ASYNC_SCENARIOS:
         dsv4_config.configure_scenario(args)
     elif args.scenario in DSV4_SYNC_CAMP2P_SCENARIOS:
         dsv4_config.configure_sync_camp2p_scenario(args)
@@ -831,7 +845,7 @@ def parse_afd_connector_extra_config(values: list[str]) -> dict[str, Any]:
 
 
 def uses_async_connector(args: argparse.Namespace) -> bool:
-    return args.afd_connector == ASYNC_AFD_CONNECTOR
+    return args.afd_connector in (ASYNC_AFD_CONNECTOR, "cam_async_megamoe")
 
 
 def uses_npu_async_process_cleanup(args: argparse.Namespace) -> bool:
@@ -839,7 +853,7 @@ def uses_npu_async_process_cleanup(args: argparse.Namespace) -> bool:
     return args.device_backend == "npu" and args.scenario in (
         ASYNC_CAM_SCENARIO,
         ASYNC_UBATCH_SCENARIO,
-        DSV4_ASYNC_CAM_SCENARIO,
+        *DSV4_ASYNC_SCENARIOS,
     )
 
 
@@ -993,13 +1007,19 @@ def run_completion_evaluation(args: argparse.Namespace) -> None:
 
 def run_concurrent_completion_evaluation(args: argparse.Namespace) -> None:
     profile = sync_shape(args.scenario)
+    prefill_only = args.scenario == DSV4_MEGAMOE_PREFILL_SCENARIO
+    if prefill_only and not args.prefill_reference_path:
+        raise ValueError("MegaMoE E2E requires --prefill-reference-path")
     evaluate_completions(
         url=f"http://{args.api_host}:{attention_api_port(args)}/v1/chat/completions",
         model=served_model_name(args, "attention"),
         output_path=Path(args.completion_output_path),
         # A synchronous profile may state that its host does not answer reliably
         # yet, and then the oracle checks the concurrent plumbing only.
-        check_answer=True if profile is None else profile.check_answer,
+        check_answer=(True if profile is None else profile.check_answer)
+        and not prefill_only,
+        prefill_only=prefill_only,
+        reference_path=Path(args.prefill_reference_path) if prefill_only else None,
     )
 
 
@@ -1034,8 +1054,10 @@ def build_env(
     ):
         env.pop("VLLM_ASCEND_ENABLE_FLASHCOMM1", None)
     env.pop("AFD_PLUGIN_EARLY_ENGINE_PATCH", None)
-    if args.scenario == DSV4_ASYNC_CAM_SCENARIO:
+    if args.scenario in DSV4_ASYNC_SCENARIOS:
         env.update(dsv4_config.role_environment(role))
+    if args.scenario == DSV4_MEGAMOE_PREFILL_SCENARIO:
+        env["AFD_ASYNC_CAM_LAYERED_GMM"] = "0"
     current_pythonpath = env.get("PYTHONPATH")
     env["PYTHONPATH"] = (
         str(REPO_ROOT)

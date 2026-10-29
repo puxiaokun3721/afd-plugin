@@ -16,7 +16,7 @@ import torch.nn as nn
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
-from vllm.distributed.parallel_state import get_dp_group
+from vllm.distributed.parallel_state import get_dp_group, get_tp_group
 from vllm.forward_context import (
     BatchDescriptor,
     DPMetadata,
@@ -75,7 +75,7 @@ from afd_plugin.compat.npu.profiler import (
     stop_afd_npu_profiler,
 )
 from afd_plugin.config import (
-    AFD_ASYNC_CONNECTOR,
+    AFD_ASYNC_CONNECTORS,
     AFDConfig,
     parse_afd_config,
 )
@@ -89,9 +89,14 @@ from afd_plugin.connectors.npu.async_cam import (
     AFDAsyncExtraInfo,
     CAMAsyncAFDConnector,
 )
+from afd_plugin.connectors.npu.async_cam_megamoe import (
+    AFD_MEGAMOE_GROUP_NAME,
+    AsyncCamMegaMoeConnector,
+)
 from afd_plugin.distributed.afd_process_group import ProcessGroupRendezvousContext
 from afd_plugin.model_executor.models.npu.async_cam_layout import (
     ASYNC_MOE_UBATCH_METADATA_KEY,
+    MEGAMOE_ACTUAL_TOKENS_KEY,
     AsyncMoeUbatchMetadata,
 )
 from afd_plugin.model_executor.models.npu.deepseek_attention_metadata import (
@@ -149,7 +154,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         local_rank = int(device.index)
         rendezvous_context = (
             ProcessGroupRendezvousContext()
-            if afd_config.connector == AFD_ASYNC_CONNECTOR
+            if afd_config.connector in AFD_ASYNC_CONNECTORS
             else None
         )
         if rendezvous_context is None:
@@ -166,7 +171,9 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             )
         self._async_cam_startup: AsyncCamStartupCoordinator | None = None
         if rendezvous_context is not None:
-            assert isinstance(self.connector, CAMAsyncAFDConnector)
+            assert isinstance(
+                self.connector, (CAMAsyncAFDConnector, AsyncCamMegaMoeConnector)
+            )
             self._async_cam_startup = AsyncCamStartupCoordinator(
                 self.connector,
                 rendezvous_context,
@@ -177,10 +184,15 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                     hidden_size=vllm_config.model_config.hf_config.hidden_size,
                     topk=vllm_config.model_config.hf_config.num_experts_per_tok,
                     activation_dtype=vllm_config.model_config.dtype,
+                    **(
+                        {"group_name": AFD_MEGAMOE_GROUP_NAME}
+                        if isinstance(self.connector, AsyncCamMegaMoeConnector)
+                        else {}
+                    ),
                 ),
             )
         self.afd_async_extra_info = AFDAsyncExtraInfo()
-        if afd_config.connector == AFD_ASYNC_CONNECTOR:
+        if afd_config.connector in AFD_ASYNC_CONNECTORS:
             connector_extra_info = self.connector.extra_info
             if not isinstance(connector_extra_info, AFDAsyncExtraInfo):
                 raise TypeError(
@@ -198,6 +210,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         self._afd_transaction_counter = 0
         self._afd_async_moe_ubatch_metadata: AsyncMoeUbatchMetadata | None = None
         self._afd_live_execution = False
+        self._afd_megamoe_actual_tokens = 0
         self.ubatch_slices = None
         self.prof = create_afd_npu_profiler("attention")
 
@@ -209,6 +222,8 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
     # into microbatching, and AFD must keep that hook's upstream default intact.
     # Patch functionality: scope an AFD live-execution flag around the delegated
     # upstream request so the hook can distinguish live requests from dummy runs.
+    # MegaMoE additionally fences/checks fatal once at the model-result boundary;
+    # a completed CR event alone does not imply that the kernel wrote output.
     # Signature: matches upstream; no added parameters.
     def execute_model(
         self,
@@ -222,6 +237,12 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         self._afd_live_execution = True
         try:
             result = super().execute_model(scheduler_output, intermediate_tensors)
+            if isinstance(self.connector, AsyncCamMegaMoeConnector):
+                self.connector.complete_attention_step()
+        except Exception as exc:
+            if isinstance(self.connector, AsyncCamMegaMoeConnector):
+                self.connector.abort_domain(str(exc))
+            raise
         finally:
             self._afd_live_execution = False
             self._afd_is_graph_replaying = previous_is_graph_replaying
@@ -252,6 +273,17 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         forward_context.dbo_enabled = False
         self._install_afd_metadata_on_forward_context(forward_context)
         self._install_async_moe_ubatch_metadata_on_forward_context(forward_context)
+        if isinstance(self.connector, AsyncCamMegaMoeConnector):
+            if not self._afd_live_execution:
+                # Synthetic warmup owns every physical row; it does not carry
+                # live decode requests, and advances the same task sequence.
+                self._afd_megamoe_actual_tokens = num_tokens_padded
+                self.connector.admit_prefill(True)
+            if forward_context.additional_kwargs is None:
+                forward_context.additional_kwargs = {}
+            forward_context.additional_kwargs[MEGAMOE_ACTUAL_TOKENS_KEY] = (
+                self._afd_megamoe_actual_tokens
+            )
         # ### PATCH END: AFD forward-context metadata
 
         assert self.model is not None
@@ -312,6 +344,24 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         cascade_attn_prefix_lens: list[list[int]] | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         # ### PATCH START: AFD NPU ubatch metadata routing
+        if isinstance(self.connector, AsyncCamMegaMoeConnector):
+            self._afd_megamoe_actual_tokens = num_tokens
+            invalid = False
+            if self._afd_live_execution:
+                computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                prompt = self.input_batch.num_prompt_tokens[:num_reqs]
+                invalid = bool(np.any(computed >= prompt))
+                if num_scheduled_tokens_np is not None:
+                    invalid = invalid or bool(
+                        np.any(computed + num_scheduled_tokens_np[:num_reqs] > prompt)
+                    )
+            admission = torch.tensor([int(invalid)], dtype=torch.int32)
+            tp_group = get_tp_group()
+            if tp_group.world_size > 1:
+                dist.all_reduce(
+                    admission, op=dist.ReduceOp.MAX, group=tp_group.cpu_group
+                )
+            self.connector.admit_prefill(int(admission[0]) == 0)
         ubatch_slices = _normalize_metadata_ubatch_slices(
             ubatch_slices,
             num_tokens_padded,

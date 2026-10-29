@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING
 
 from afd_plugin.config import (
     AFD_ASYNC_CONNECTOR,
+    AFD_ASYNC_CONNECTORS,
+    AFD_MEGAMOE_CONNECTOR,
     CAMP2P_CONNECTOR,
     AFDConfig,
     is_afd_async_dp,
@@ -50,7 +52,7 @@ def fail_if_unsupported_npu_afd_features(
     if is_dsv4:
         _fail_if_unsupported_dsv4_connector(afd_config)
 
-    if afd_config.connector == AFD_ASYNC_CONNECTOR:
+    if afd_config.connector in AFD_ASYNC_CONNECTORS:
         _fail_if_unsupported_npu_afd_async_features(
             vllm_config,
             afd_config,
@@ -58,6 +60,8 @@ def fail_if_unsupported_npu_afd_features(
         )
         if is_dsv4:
             _fail_if_unsupported_dsv4_async_features(afd_config, extra_info)
+        if afd_config.connector == AFD_MEGAMOE_CONNECTOR:
+            _validate_megamoe_features(vllm_config, afd_config, extra_info)
         return
 
     if afd_config.compute_gate_on_attention:
@@ -152,7 +156,7 @@ def _fail_if_unsupported_dsv4_connector(afd_config: AFDConfig) -> None:
     CAMP2P moves them over the A2E ids channel with the gate left on FFN.
     """
 
-    if afd_config.connector not in (AFD_ASYNC_CONNECTOR, CAMP2P_CONNECTOR):
+    if afd_config.connector not in (*AFD_ASYNC_CONNECTORS, CAMP2P_CONNECTOR):
         raise RuntimeError(
             "DSV4 NPU AFD supports only CAMAsyncAFDConnector and "
             f"CAMP2pAFDConnector; got {afd_config.connector!r}",
@@ -183,6 +187,11 @@ def _fail_if_unsupported_npu_afd_async_features(
             "CAMAsyncAFDConnector requires additional_config['afd'] "
             "with async=true and connector='CAMAsyncAFDConnector'",
         )
+    if (
+        afd_config.connector == AFD_MEGAMOE_CONNECTOR
+        and not vllm_config.model_config.enforce_eager
+    ):
+        raise RuntimeError("cam_async_megamoe requires enforce_eager=true")
     if not bool(vllm_config.model_config.enforce_eager):
         graph_mode = vllm_config.compilation_config.cudagraph_mode.name
         if not (
@@ -303,6 +312,46 @@ def _fail_if_unsupported_npu_async_moe_ubatching_features(
         raise RuntimeError(
             "async_moe_split='token' requires Attention DP+TP/SP with "
             "tensor_parallel_size > 1",
+        )
+
+
+def _validate_megamoe_features(
+    vllm_config: VllmConfig,
+    afd_config: AFDConfig,
+    extra_info: ConnectorExtraInfo,
+) -> None:
+    # Device/runtime imports stay inside worker initialization. CPU-only config
+    # tooling does not load torch_npu merely by importing this module.
+    import torch
+    from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+    from afd_plugin.connectors.npu.async_cam_megamoe import MegaMoeExtraInfo
+
+    if not isinstance(extra_info, MegaMoeExtraInfo):
+        raise TypeError("cam_async_megamoe requires MegaMoeExtraInfo")
+    if get_ascend_device_type() != AscendDeviceType.A3:
+        raise RuntimeError("cam_async_megamoe requires Ascend A3")
+    if not _is_dsv4_target(vllm_config):
+        raise RuntimeError("cam_async_megamoe currently supports DeepSeek V4 only")
+    if vllm_config.model_config.dtype != torch.bfloat16:
+        raise RuntimeError("cam_async_megamoe requires BF16 model activations")
+    if vllm_config.use_v2_model_runner or vllm_config.speculative_config is not None:
+        raise RuntimeError(
+            "cam_async_megamoe requires ModelRunnerV1 without speculative decoding"
+        )
+    parallel = vllm_config.parallel_config
+    if (
+        parallel.prefill_context_parallel_size != 1
+        or parallel.decode_context_parallel_size != 1
+    ):
+        raise RuntimeError("cam_async_megamoe does not support context parallelism")
+    if parallel.pipeline_parallel_size != 1:
+        raise RuntimeError("cam_async_megamoe requires pipeline_parallel_size=1")
+    if afd_config.is_ffn_server and not parallel.enable_expert_parallel:
+        raise RuntimeError("cam_async_megamoe FFN requires enable_expert_parallel=true")
+    if afd_config.is_ffn_server and parallel.tensor_parallel_size != 1:
+        raise RuntimeError(
+            "cam_async_megamoe FFN requires TP=1 and expert parallel placement"
         )
 
 

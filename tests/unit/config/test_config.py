@@ -243,3 +243,20 @@ def test_compute_hash_changes_for_graph_affecting_fields():
     ffn = AFDConfig(role="ffn")
 
     assert attention.compute_hash() != ffn.compute_hash()
+
+
+@pytest.mark.parametrize("role", ["attention", "ffn"])
+def test_megamoe_connector_participates_in_async_dp(role):
+    source = {
+        "afd": {
+            "connector": "cam_async_megamoe",
+            "role": role,
+            "async_dp": True,
+            "num_attention_ranks": 8,
+            "num_ffn_ranks": 8,
+            "compute_gate_on_attention": True,
+        }
+    }
+    config = parse_afd_config(source)
+    assert config.connector == "cam_async_megamoe"
+    assert is_afd_async_dp(source)

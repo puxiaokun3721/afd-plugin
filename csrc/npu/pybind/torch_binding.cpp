@@ -146,6 +146,13 @@ TORCH_LIBRARY(afd_ascend, ops) {
   ops.impl("e2a", torch::kPrivateUse1, &afd_plugin::e2a);
 }
 
+#ifdef AFD_HAS_MEGA_MOE
+namespace afd_plugin::mega_moe { void register_weight_helpers(pybind11::module_ &); }
+#endif
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.doc() = "AFD Ascend A2E/E2A custom operator bindings";
+  m.doc() = "AFD Ascend custom operator bindings";
+#ifdef AFD_HAS_MEGA_MOE
+  afd_plugin::mega_moe::register_weight_helpers(m);
+#endif
 }

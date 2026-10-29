@@ -1,0 +1,87 @@
+{
+  "schema_version": "afd-knowledge-audit-export.v1",
+  "export_metadata": {
+    "kind": "sanitized-portable-export",
+    "original_file_sha256": "23110f6ebcb862e09becb1d907142afdf23cc6cd958f54d84b6b119718190d70",
+    "original_schema_version": "cannbot-retrieval-state.v1",
+    "is_original_immutable_receipt": false,
+    "redactions": [
+      {
+        "replacement": "<KNOWLEDGE_ROOT>",
+        "description": "Replaces the original machine-specific knowledge checkout root; remaining card paths are relative to that root."
+      },
+      {
+        "replacement": "<AUDIT_ROOT>",
+        "description": "Replaces the original machine-specific receipt directory; remaining filenames identify this directory."
+      }
+    ],
+    "verification_note": "This portable export preserves query and card provenance but is not the original receipt. Its original file SHA-256 identifies the separately retained local original. Regenerate receipts and retrieval state using the knowledge tools in the target environment before claiming an audit-chain result."
+  },
+  "exported_document": {
+    "schema_version": "cannbot-retrieval-state.v1",
+    "target": {
+      "entity": "A3 CAMAsync MegaMoE local synchronization and remote Ready/Done publication",
+      "platforms": [
+        "a3"
+      ]
+    },
+    "decisions": [
+      {
+        "id": "local-crosscore",
+        "question": "What local mixed-core synchronization constraints apply to preserving A3 native CrossCoreSetFlag and SyncAll?",
+        "status": "covered",
+        "receipts": [
+          "<AUDIT_ROOT>/crosscore.json",
+          "<AUDIT_ROOT>/syncall.json"
+        ],
+        "evidence": [
+          {
+            "path": "ops/ascendc/apis/simd_api/basic_api/sync_control/inter_core_sync/cross_core_set_flag_isasi",
+            "card_sha256": "931d6b46c93ca2b43b15327bba489d19109079dabc4ff07f72dca1bb1b322484"
+          },
+          {
+            "path": "ops/ascendc/apis/simd_api/basic_api/sync_control/inter_core_sync/sync_all",
+            "card_sha256": "4a92f885ef2760bb9e5e38de9dfe14515715056cc31968dce5b32414f1bd21ce"
+          }
+        ]
+      },
+      {
+        "id": "local-mte3-drain",
+        "question": "What local source-pipeline completion and pairing semantics does SetFlag/WaitFlag provide for an MTE3 drain?",
+        "status": "covered",
+        "receipts": [
+          "<AUDIT_ROOT>/pipeline.json"
+        ],
+        "evidence": [
+          {
+            "path": "ops/ascendc/apis/simd_api/basic_api/sync_control/intra_core_sync/set_flag_wait_flag_isasi",
+            "card_sha256": "b8b3c335a3737e1c4123f7398d9d133c92e4532099d23a6ccecb552e690984ad"
+          }
+        ]
+      },
+      {
+        "id": "scalar-cache",
+        "question": "What local scalar DCache and GM consistency constraints apply to polling or writing protocol state?",
+        "status": "covered",
+        "receipts": [
+          "<AUDIT_ROOT>/dcache.json"
+        ],
+        "evidence": [
+          {
+            "path": "ops/ascendc/apis/simd_api/basic_api/cache_control/data_cache_clean_and_invalid",
+            "card_sha256": "e2150d35bbfa17cbba9cf30e2a8887046ebfd12b2feb45568c17a0f31d77df4a"
+          }
+        ]
+      },
+      {
+        "id": "remote-ready-atomicity",
+        "question": "Does available A3 evidence guarantee remote 64-bit Ready/Done atomic observation and payload-before-ready visibility for the proposed protocol?",
+        "status": "gap",
+        "receipts": [
+          "<AUDIT_ROOT>/remote_atomicity.json"
+        ],
+        "evidence": []
+      }
+    ]
+  }
+}

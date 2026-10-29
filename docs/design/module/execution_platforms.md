@@ -9,6 +9,8 @@ primary_code_paths:
   - "afd_plugin/compat/profiler.py"
   - "afd_plugin/compat/npu/forward_context.py"
   - "afd_plugin/compat/npu/ops.py"
+  - "afd_plugin/compat/npu/mega_moe_abi.py"
+  - "afd_plugin/compat/npu/cam_async_megamoe.py"
   - "afd_plugin/compat/npu/profiler.py"
   - "afd_plugin/v1/worker/cuda_graph.py"
   - "afd_plugin/v1/worker/dbo.py"
@@ -27,6 +29,10 @@ related_code_paths:
 depends_on:
   - "plugin_boundary.md"
 validation_paths:
+  - "tests/unit/compat/npu/test_mega_moe_abi.py"
+  - "tests/unit/compat/npu/test_cam_async_megamoe.py"
+  - "tests/npu/a3_camasync_megamoe_*.py"
+  - "tests/npu/manifests/a3_megamoe_*.json"
   - "tests/unit/compat/test_profiler.py"
   - "tests/unit/compat/test_ascend_ops.py"
   - "tests/unit/compat/npu/test_profiler.py"

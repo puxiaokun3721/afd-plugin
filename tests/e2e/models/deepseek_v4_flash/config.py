@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 from typing import NamedTuple
 
+DSV4_MEGAMOE_PREFILL_SCENARIO = "afd-dsv4-flash-megamoe-prefill-dp2tp4-ep8"
 DSV4_ASYNC_CAM_SCENARIO = "afd-dsv4-flash-async-cam-dp2tp4-ep8"
 DSV4_SYNC_CAMP2P_A5_SCENARIO = "afd-dsv4-flash-sync-camp2p-2a2f"
 DSV4_SYNC_CAMP2P_A3_SCENARIO = "afd-dsv4-flash-sync-camp2p-8a8f"
@@ -20,7 +21,8 @@ DSV4_SYNC_CAMP2P_SCENARIOS = (
     DSV4_SYNC_CAMP2P_A5_SCENARIO,
     DSV4_SYNC_CAMP2P_A3_SCENARIO,
 )
-DSV4_SCENARIOS = (DSV4_ASYNC_CAM_SCENARIO, *DSV4_SYNC_CAMP2P_SCENARIOS)
+DSV4_ASYNC_SCENARIOS = (DSV4_ASYNC_CAM_SCENARIO, DSV4_MEGAMOE_PREFILL_SCENARIO)
+DSV4_SCENARIOS = (*DSV4_ASYNC_SCENARIOS, *DSV4_SYNC_CAMP2P_SCENARIOS)
 DSV4_ATTENTION_RANKS = 8
 DSV4_FFN_RANKS = 8
 DSV4_ATTENTION_TP_SIZE = 4
@@ -348,7 +350,8 @@ def _configure_dsv4_arguments(
 
 def configure_scenario(args: argparse.Namespace) -> None:
     """Configure the 16-NPU asynchronous CAM deployment."""
-    args.afd_connector = "CAMAsyncAFDConnector"
+    megamoe = args.scenario == DSV4_MEGAMOE_PREFILL_SCENARIO
+    args.afd_connector = "cam_async_megamoe" if megamoe else "CAMAsyncAFDConnector"
     args.afd_async = True
     args.compute_gate_on_attention = True
     args.afd_connector_extra_config = [
@@ -359,6 +362,7 @@ def configure_scenario(args: argparse.Namespace) -> None:
                 "async_moe_ubatching": True,
                 "async_moe_num_ubatches": 2,
                 "async_moe_split": "token",
+                **({"recv_route_capacity": 4096} if megamoe else {}),
             }
         )
     ]

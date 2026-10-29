@@ -45,6 +45,18 @@ copy_ops_include() {
         cp -rf "$src_dir/utils/op_kernel/"* "$dst_dir/op_kernel/" 2>/dev/null || true
     fi
 
+    # MegaMoE's native relative includes must retain their directory tree.
+    # Keep this outside op_host/op_kernel: their recursive source discovery
+    # must not register the upstream MegaMoe entry or third-party examples.
+    for name in "${ops[@]}"; do
+        case "$name" in
+            afd_mega_moe_dispatch_send|afd_mega_moe_scheduler|afd_mega_moe_ffn|afd_mega_moe_combine_recv)
+                cp -R "$src_dir/afd_mega_moe_common" "$dst_dir/"
+                break
+                ;;
+        esac
+    done
+
     # Copy op_host/op_kernel/op_api of every selected operator
     for name in "${ops[@]}"; do
         local subdir="$src_dir/$name"

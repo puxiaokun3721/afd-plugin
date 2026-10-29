@@ -329,7 +329,9 @@ def _new_attention_runner():
         AFDNPUAttentionModelRunner,
     )
 
-    return object.__new__(AFDNPUAttentionModelRunner)
+    runner = object.__new__(AFDNPUAttentionModelRunner)
+    runner.connector = SimpleNamespace(control_plane=None)
+    return runner
 
 
 def test_npu_attention_live_execution_scope_restores_on_success_and_error(

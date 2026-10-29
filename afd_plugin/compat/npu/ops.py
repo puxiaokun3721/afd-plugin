@@ -120,6 +120,31 @@ def ensure_cam_async_ops_available() -> None:
         ) from exc
 
 
+@lru_cache(maxsize=1)
+def ensure_mega_moe_ops_available() -> None:
+    """Load the four A3 MegaMoE entrypoints from the plugin-owned OPP."""
+    # Runtime imports are deferred to keep CPU-only package import independent
+    # of the optional torch/torch-npu extension.
+    _ensure_afd_custom_opp_env()
+    try:
+        import torch
+
+        import afd_plugin._C_ascend  # noqa: F401
+
+        _ = (
+            torch.ops.afd_ascend.afd_mega_moe_dispatch_send,
+            torch.ops.afd_ascend.afd_mega_moe_scheduler,
+            torch.ops.afd_ascend.afd_mega_moe_ffn,
+            torch.ops.afd_ascend.afd_mega_moe_combine_recv,
+        )
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError(
+            "A3 CAMAsync MegaMoE requires all four plugin-owned afd_mega_moe_* "
+            "operators. Build AFD with AFD_BUILD_ASCEND_OPS=1 and "
+            "AFD_SOC_VERSION=ascend910_93 in a torch-npu/CANN environment."
+        ) from exc
+
+
 __all__ = [
     "AFD_ASCEND_OPS_NAMESPACE",
     "AFD_ASCEND_VENDOR_NAME",
@@ -132,6 +157,7 @@ __all__ = [
     "ensure_afd_ascend_ops_loaded",
     "ensure_cam_async_ops_available",
     "ensure_cam_p2p_ops_available",
+    "ensure_mega_moe_ops_available",
     "get_afd_cann_vendor_path",
     "get_afd_cust_opapi_path",
     "has_afd_ascend_ops",

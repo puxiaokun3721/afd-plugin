@@ -428,23 +428,46 @@ def test_model_extraction_preserves_weights_and_topk_scaling(monkeypatch):
 
 
 @pytest.mark.parametrize("mixed", [False, True])
-def test_model_extraction_skips_other_quantization(monkeypatch, mixed):
+@pytest.mark.parametrize("require_homogeneous", [False, True])
+def test_model_extraction_skips_other_quantization(
+    monkeypatch, mixed, require_homogeneous
+):
     method = model_weights_method(monkeypatch)
     layers = [model_layer(2), model_layer(5)]
     layers[0].mlp.experts.quant_type = "w8a8"
     if not mixed:
         layers[1].mlp.experts.quant_type = "w8a8"
-    specs, reason = method(layers)
+    specs, reason = method(layers, require_homogeneous=require_homogeneous)
     assert specs == []
     assert "non-W4A8 or mixed" in reason
 
 
-def test_model_extraction_rejects_missing_compensation(monkeypatch):
+@pytest.mark.parametrize("require_homogeneous", [False, True])
+def test_model_extraction_rejects_missing_compensation(
+    monkeypatch, require_homogeneous
+):
     method = model_weights_method(monkeypatch)
     layer = model_layer(5)
     del layer.mlp.experts.routed_experts._parameters["w13_scale_bias"]
     with pytest.raises(ValueError, match="layer 5: missing loaded w13_scale_bias"):
-        method([layer])
+        method([layer], require_homogeneous=require_homogeneous)
+
+
+@pytest.mark.parametrize("require_homogeneous", [False, True])
+def test_model_extraction_preserves_layer_limits_when_supported(
+    monkeypatch, require_homogeneous
+):
+    method = model_weights_method(monkeypatch)
+    layers = [model_layer(2), model_layer(5)]
+    layers[0].mlp.swiglu_limit = 7.0
+    layers[1].mlp.swiglu_limit = 10.0
+    specs, reason = method(layers, require_homogeneous=require_homogeneous)
+    if require_homogeneous:
+        assert specs == []
+        assert "heterogeneous" in reason
+    else:
+        assert reason == ""
+        assert [spec.swiglu_limit for spec in specs] == [7.0, 10.0]
 
 
 def test_model_extraction_skips_heterogeneous_semantics(monkeypatch):

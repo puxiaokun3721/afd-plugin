@@ -1,0 +1,152 @@
+{
+  "schema_version": "afd-knowledge-audit-export.v1",
+  "export_metadata": {
+    "kind": "sanitized-portable-export",
+    "original_file_sha256": "a5cbe4017c8698424696624536a68899f223ebb2543fb81fa0f23385b66e6870",
+    "original_schema_version": "cannbot-knowledge-search.v3",
+    "is_original_immutable_receipt": false,
+    "redactions": [
+      {
+        "replacement": "<KNOWLEDGE_ROOT>",
+        "description": "Replaces the original machine-specific knowledge checkout root; remaining card paths are relative to that root."
+      },
+      {
+        "replacement": "<AUDIT_ROOT>",
+        "description": "Replaces the original machine-specific receipt directory; remaining filenames identify this directory."
+      }
+    ],
+    "verification_note": "This portable export preserves query and card provenance but is not the original receipt. Its original file SHA-256 identifies the separately retained local original. Regenerate receipts and retrieval state using the knowledge tools in the target environment before claiming an audit-chain result."
+  },
+  "exported_document": {
+    "schema_version": "cannbot-knowledge-search.v3",
+    "knowledge_root": "<KNOWLEDGE_ROOT>",
+    "knowledge_commit": "b82acf8cb04dfe4850eeacb2016f189d36cfe6a2",
+    "knowledge_dirty": false,
+    "request": {
+      "query": "64位原子",
+      "decision": "remote-ready-atomicity",
+      "match": "literal",
+      "domain": "ops",
+      "technology": "ascendc",
+      "profile": "guides",
+      "task": null,
+      "tags": [],
+      "platforms": [
+        "a3"
+      ],
+      "include_unlocated": false,
+      "include_shared": false,
+      "source_technology": null,
+      "target_technology": null,
+      "status": "stable",
+      "filters": {
+        "domain": "ops",
+        "technology": "ascendc",
+        "profile": "guides",
+        "task": null,
+        "tags": [],
+        "platforms": [
+          "a3"
+        ],
+        "include_unlocated": false,
+        "include_shared": false,
+        "source_technology": null,
+        "target_technology": null,
+        "status": "stable"
+      },
+      "limit": 3
+    },
+    "request_sha256": "20f20da1e56a596cf93844cc88e56158a137d93519209fea312fa01e3dbfcfc7",
+    "index": {
+      "schema_version": "cannbot-knowledge-index.v1",
+      "index_version": 3,
+      "content_fingerprint": "704118fcd54d71d02ff3efbbac85b6502288c03a1ee6121b65b11d2686e5edf6",
+      "governance_fingerprint": "f5b2aca18eca27003166e8306c83b99cc74cf665656c7ade6ea1eb54433331be",
+      "card_count": 8066,
+      "posting_count": 5415252,
+      "built_repository_state": {
+        "commit": "b82acf8cb04dfe4850eeacb2016f189d36cfe6a2",
+        "dirty": false
+      },
+      "query_repository_state": {
+        "commit": "b82acf8cb04dfe4850eeacb2016f189d36cfe6a2",
+        "dirty": false
+      }
+    },
+    "result": {
+      "schema_version": "knowledge-search.v5",
+      "request_sha256": "20f20da1e56a596cf93844cc88e56158a137d93519209fea312fa01e3dbfcfc7",
+      "request": {
+        "query": "64位原子",
+        "decision": "remote-ready-atomicity",
+        "match": "literal",
+        "domain": "ops",
+        "technology": "ascendc",
+        "profile": "guides",
+        "task": null,
+        "tags": [],
+        "platforms": [
+          "a3"
+        ],
+        "include_unlocated": false,
+        "include_shared": false,
+        "source_technology": null,
+        "target_technology": null,
+        "status": "stable",
+        "filters": {
+          "domain": "ops",
+          "technology": "ascendc",
+          "profile": "guides",
+          "task": null,
+          "tags": [],
+          "platforms": [
+            "a3"
+          ],
+          "include_unlocated": false,
+          "include_shared": false,
+          "source_technology": null,
+          "target_technology": null,
+          "status": "stable"
+        },
+        "limit": 3
+      },
+      "query": "64位原子",
+      "match": "literal",
+      "filters": {
+        "domain": "ops",
+        "technology": "ascendc",
+        "profile": "guides",
+        "task": null,
+        "tags": [],
+        "platforms": [
+          "a3"
+        ],
+        "include_unlocated": false,
+        "include_shared": false,
+        "source_technology": null,
+        "target_technology": null,
+        "status": "stable"
+      },
+      "limit": 3,
+      "count": 0,
+      "index": {
+        "schema_version": "cannbot-knowledge-index.v1",
+        "index_version": 3,
+        "content_fingerprint": "704118fcd54d71d02ff3efbbac85b6502288c03a1ee6121b65b11d2686e5edf6",
+        "governance_fingerprint": "f5b2aca18eca27003166e8306c83b99cc74cf665656c7ade6ea1eb54433331be",
+        "card_count": 8066,
+        "posting_count": 5415252,
+        "built_repository_state": {
+          "commit": "b82acf8cb04dfe4850eeacb2016f189d36cfe6a2",
+          "dirty": false
+        },
+        "query_repository_state": {
+          "commit": "b82acf8cb04dfe4850eeacb2016f189d36cfe6a2",
+          "dirty": false
+        }
+      },
+      "results": [],
+      "hits": []
+    }
+  }
+}
