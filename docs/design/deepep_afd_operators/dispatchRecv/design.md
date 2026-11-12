@@ -1,5 +1,7 @@
 # dispatchRecv 算子设计
 
+> CAM 事务模式由 DR 在固定选批内按完整 (layer, expert) 组生成片内 Active，再进入搬运预检。 见 [F 侧计算事务](../../a5_afd_ffn_transaction.md)。
+
 实现基线：DeepEP-Ascend `3b25377d04b24fc6154698ded78a2bcb2c59afff`。必须同时阅读[公共契约](../common_contract.md)。本文为设计产物，未完成编译/实机验收。
 
 ## 多来源容量边界

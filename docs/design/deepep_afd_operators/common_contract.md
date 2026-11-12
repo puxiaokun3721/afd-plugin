@@ -1,5 +1,7 @@
 # DeepEP-AFD 算子公共接口、布局与原语契约
 
+> 本文记述默认逐片路径。显式启用 CAM 事务模式时，F 侧 Active 尾部、共享进度和整组容量采用 [F 侧计算事务](../a5_afd_ffn_transaction.md)。
+
 本文件与四个通信算子的 design.md 合起来构成代码生成输入；ffnScheduler/design.md 的范围为接口契约，当前开发实现状态见[设计入口](../README.md)。它们细化[五算子总设计](../a5_async_afd_deepep_operator_design.md)。实现目标是 DeepEP-Ascend 仓库，基线commit `3b25377d04b24fc6154698ded78a2bcb2c59afff`，不是另建一个无关Ascend算子工程。
 
 ## 1. 公共约定与类型

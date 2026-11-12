@@ -1,5 +1,7 @@
 # combineSend 算子设计
 
+> CAM 事务模式由 CS 在回包排空后提交片间进度并逐通信轮确认，scheduler 只在事务边界重新选批。 见 [F 侧计算事务](../../a5_afd_ffn_transaction.md)。
+
 实现基线：DeepEP-Ascend `3b25377d04b24fc6154698ded78a2bcb2c59afff`。必须同时阅读[公共契约](../common_contract.md)。本文为设计产物，未完成编译/实机验收。
 
 ## 多来源片数与末片完成

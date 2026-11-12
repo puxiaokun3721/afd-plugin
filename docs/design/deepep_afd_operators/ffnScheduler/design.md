@@ -1,5 +1,7 @@
 # ffnScheduler 接口设计
 
+> CAM 事务模式的 scheduler 一次选完整通信轮，DR 在固定集合内切片，CS 提交进度。见 [F 侧计算事务](../../a5_afd_ffn_transaction.md)。
+
 本轮冻结接口与首版内部实现。使用单AIV执行有限的元数据扫描，按到齐组选择phase/layer并输出有界Segment；不遍历token或搬运hidden。DeepEP原生没有独立AF scheduler，新增部分明确隔离在layout/afd/scheduler.hpp和impls/afd/ffn_scheduler.hpp。开发沿现有DeepEP JIT/owner接入，不创建独立模板工程；设备编译和功能/性能验收仍需A5环境。
 
 必须同时阅读[公共ABI](../common_contract.md)。以下是AFD新增能力，DeepEP原生没有与之等价的独立scheduler。

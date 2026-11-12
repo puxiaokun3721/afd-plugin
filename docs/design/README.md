@@ -13,6 +13,10 @@
 
 初版实现采用 DeepEP-Ascend 小算子路线；总体方案中的 MegaMoE 和 MoeDistribute MTE 是其他后端设计，不表示已经实现。
 
+## CAM 事务模式
+
+基于 UMDK CAM #3860/#3861 的跨 DP、跨层整轮选批与整专家组分片见 [F 侧计算事务](a5_afd_ffn_transaction.md)。
+
 ## 代码与验收状态
 
 五算子的开发实现位于独立的 [DeepEP-Ascend AFD 代码说明](https://github.com/puxiaokun3721/DeepEP-Ascend/blob/afd-five-operator-baseline/docs/afd/README.md)，分支为 `afd-five-operator-baseline`。本仓库承载框架和设计，不能据此认为五算子已经接入框架并完成端到端验收。

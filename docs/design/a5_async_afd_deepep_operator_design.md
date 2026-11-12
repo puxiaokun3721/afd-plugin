@@ -1,5 +1,7 @@
 # A5 异步 AFD：DeepEP-Ascend 五算子详细设计
 
+> 本文的逐片 scheduler 对应默认路径。UMDK CAM 事务模式中的选批、DR 切片和 CS 提交见 [F 侧计算事务](a5_afd_ffn_transaction.md)。
+
 日期：2026-10-16。范围：`dispatchSend`、`dispatchRecv`、`combineSend`、`combineRecv`、`ffnScheduler`。本文定义接口与执行设计；五算子已有开发实现，当前实现范围与验证状态见[设计索引](README.md)，不能将设计目标视为已实机验证的 API。
 
 上位约束：[整体设计 v3](a5_async_afd_design.md)。本版只实施 DeepEP-AFD 小算子路径；GMM1、activation/quant、GMM2 属于外部计算链，必须遵守本文 Active gate 和输出生命周期，但不重新设计其数值内核。MegaMoE/MTE 不在本次接口展开范围。
