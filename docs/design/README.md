@@ -15,7 +15,7 @@
 
 ## CAM 事务模式
 
-基于 UMDK CAM #3860/#3861 的跨 DP、跨层整轮选批与整专家组分片见 [F 侧计算事务](a5_afd_ffn_transaction.md)。
+基于 UMDK CAM #3860/#3861 的跨 DP、跨层整轮选批与整专家组分片见 [F 侧计算事务](a5_afd_ffn_transaction.md)。[Poll 设备时间戳和 Attention 成员独立分轮](a5_afd_ffn_transaction.md#11-poll-设备时间戳与-attention-成员独立分轮) 附接口、内存布局和 H7168 验收方案。
 
 ## 代码与验收状态
 

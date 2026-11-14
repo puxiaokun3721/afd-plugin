@@ -2,7 +2,7 @@
 
 本文按一轮数据从 Attention 到 FFN、计算后回到 Attention 的顺序展开。可以先用第 1 节讲清分工，再用第 3、4 节画出通信窗口，用第 6、7 节讲清为什么一次选批能安全地执行多片，最后用第 8 节把具体行号串起来。
 
-实现基点是 UMDK `cam_feature@9179865e`，已合入 #3860 和 #3861。本文描述的是 CAM `b795d1df` 和 DeepEP owner/scheduler `8757a68d` 配套的 **BF16 事务模式**。默认模式仍由 scheduler 逐片生成 Active，参见[五算子设计](a5_async_afd_deepep_operator_design.md)。文末另列 DeepEP FP8 布局的预算例和设备待验项。 [CAM 事务提交](https://gitcode.com/puxiaokun3721/umdk/commit/b795d1dfc2b7e6da64c48af02d7f00fecbfacaa7) · [DeepEP 支持提交](https://github.com/puxiaokun3721/DeepEP-Ascend/commit/8757a68d5f258c302ab5146df62119b70ea80b6d)
+实现基点是 UMDK `cam_feature@9179865e`，已合入 #3860 和 #3861。本文描述的是 CAM `b795d1df` 和 DeepEP owner/scheduler `8757a68d` 配套的 **BF16 事务模式**。默认模式仍由 scheduler 逐片生成 Active，参见[五算子设计](a5_async_afd_deepep_operator_design.md)。文末另列 DeepEP FP8 布局的预算例和设备待验项。[第 11 节](#11-poll-设备时间戳与-attention-成员独立分轮) 说明后续 BF16 事务接口增量、与基线的区别及实机验收。 [CAM 事务提交](https://gitcode.com/puxiaokun3721/umdk/commit/b795d1dfc2b7e6da64c48af02d7f00fecbfacaa7) · [DeepEP 支持提交](https://github.com/puxiaokun3721/DeepEP-Ascend/commit/8757a68d5f258c302ab5146df62119b70ea80b6d)
 
 ## 1. 全链路和三个事务边界
 
@@ -43,6 +43,8 @@ Attention 侧 A                                    FFN 侧 F
 ### 轮号和容量是两套计数
 
 A 的同一 DP 事务为所有成员给出共同通信轮数，常用 `W=max(1,max_l ceil(B_l/C_l))`。第 `r` 轮在 lane `l` 上从 `begin=min(B_l,r*C_l)` 开始，长度 `len=min(C_l,B_l-begin)`。`B_l` 和 `len` 包含 mask 为假的行，先耗尽的成员仍发布空轮。F 一次选批只选当前已经发布并到齐的轮，下一轮后来发布时可参加另一个计算事务。
+
+本段描述基线的 DP 共同轮数。成员独立分轮按 [第 11.2 节](#112-各-attention-成员独立分轮) 构造后续轮的等待集合。
 
 ## 2. 初始化和地址目录
 
@@ -251,7 +253,7 @@ active
 
 | 步骤 | 读取 | 写入及可见性要求 |
 |---|---|---|
-| **Poll → Scheduler** | F InputReady、Inbox、Payload counts 和本地 Pending。 | Poll 只观察。Scheduler 接管新轮、冻结选中集合和组计数，最后发布事务 `Selected`。这时片头为 NOP，计算尚未开始。忙态重复调用 scheduler 不改变选中集合。 |
+| **Poll → Scheduler** | Poll 读 F InputReady 及本地 Pending、Active。Scheduler 另外读 Inbox 和 Payload counts。 | Poll 输出就绪分类，开启时间记录时读取 Inbox 并写入首次观测周期。Scheduler 接管新轮、冻结选中集合和组计数，最后发布事务 `Selected`。这时片头为 NOP，计算尚未开始。忙态重复调用 scheduler 不改变选中集合。 |
 | **DR 取片** | 已提交的 `next_group`，固定 Entry/Member、各组总行数和容量。 | 按组号升序跳过空组。一个非空组整体放得下才加入，余量不足就停在该组之前。DR 建当前片，写拟议 `slice_end`，事务进 `Slice`，执行状态进 `SELECTED`。已退役轮从本片 Member 和 Segment 中排除。 |
 | **DR 预检与搬运** | 本片 Active、Context、未退役 Member 的 Inbox/Ready、counts/prefix/refs/record。 | 校验代次、Entry 层号、lane 区间、专家和 group 边界，再把有效行搬到 `recv_x`，写来源 metadata。每组 padding hidden/SF 为零，metadata 四列为 -1，片尾之后保持原值。全部输出搬完才发布本地 `ExecutionState.INPUT_READY`。 |
 | **FFN → computeReady** | 本片的层槽、计算组行数与位置、对应层和 expert 的权重。 | W2 结果按 DR 相同行位写 `combine_x`。`WORK` 完成后发布 `COMPUTE_READY`。全零 `CONTROL` 跳过计算，保持 `INPUT_READY` 直接交 CS。 |
@@ -388,3 +390,68 @@ python -B tests/afd/ffn_transaction_sim.py --trace "$env:TEMP/afd-ffn-transactio
 - **调度。** F 用 `ffnPoll()` 观察，到齐由 `ffnScheduler()` 接管。收到 `Selected` 后开始循环 DR → FFN → `computeReady()` → CS，直到事务 `Complete`。A5 诊断 runner 由 Host 同步读取状态并输出 `FFN_TX` 事件，字段包含 F rank、事务号、phase、通信轮键、片号、计算组和逐轮确认。生产接入应使用后端所需的设备侧布局和依赖。
 - **验收。** 同一 F 的同一 `txn_id` 只有一次有效选批，包含固定通信轮集合。各 `(layer,expert)` 只在一个片出现。每轮在本 F 完成一次并独立确认，跨层回包逐 MB 与对应层独立 golden 一致。覆盖空轮、成员迟到、P/D 同时到齐、不同 F 选批不同、容量不足和已退役槽复用。
 - **证据边界。** 配套提交提供 CPU 模拟、原有 CPU 回归和 C++ 辅助逻辑验证。CANN/Bisheng 构建与加载、A5 可见性与回包顺序、目标 GMM 形状、图模式和性能须分别以对应实机证据验收。 [构建与八卡诊断命令](https://github.com/puxiaokun3721/DeepEP-Ascend/blob/8757a68d5f258c302ab5146df62119b70ea80b6d/tests/afd/README-ffn-transaction.md) · [诊断 runner](https://github.com/puxiaokun3721/DeepEP-Ascend/blob/8757a68d5f258c302ab5146df62119b70ea80b6d/tests/afd/ffn_transaction_runner.py)
+
+## 11. Poll 设备时间戳与 Attention 成员独立分轮
+
+两项增量都沿用 BF16 计算事务，可独立启用。Poll 把首次看到 Ready 的时间交给调用方。成员独立分轮由 A 侧为每个成员申报本地轮数，F 根据首轮申报确定后续各轮的等待集合。两项可以分别验证。以下为待 A5 验收的候选接口和测试口径，后续实机统一使用 `H=7168`。
+
+### 11.1 Poll 记录哪一个时间
+
+Poll 在本 F 的设备上读取通信窗口的 Ready。第一次看到匹配当前期待位的 `NEW_READY` 时，在该 Ready 已经读回以后调用 `asc_get_system_cycle()`，保存原始 `uint64_t` 周期数。此时刻受 Poll 调用间隔影响。输入可以在两次 Poll 之间到达，记录的是 Poll 观测时刻。Attention 发布、Scheduler 接管和首次选中分别是其他事件。 [Ascend 950 系统计数器](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/API/ascendcopapi/docs/en/api/SIMD-API/C-API/sys_var/asc_get_system_cycle.md)
+
+- **单位**。调度消费接口以原始周期为单位。按项目 Ascend 950 S 侧的口径，周期差除以 1000 得微秒。读取方应使用同一 F 上经验证的同源计数器。实机验收用独立的第二次设备读取确认可比较性。
+- **标记**。时间与该 lane 的本次发布代次绑定，单独保存有效标志。同一次到达反复被 Poll 看见时沿用第一次周期。Ready 位在槽复用时重复出现，去重要同时区分发布代次。若使用当前 Pending 保存的上一轮接管 tick，它只用于区分同 lane 的发布，和已有 Scheduler 的排序意义相互独立。
+- **提前退役**。某轮在 FFN 计算事务尚有后续片时已经完成，Poll 可按已退役 Member 的输入位翻转识别下一代。即使 Scheduler 尚未清理旧 Pending，也能记录新一轮。旧 Pending、Ready 不匹配和从未被 Poll 观测到的轮不会获得新的时间记录。
+
+`AFDBuffer.ffnPollTimestamp(timestamps)` 和 `cam_afd_ffn_poll_timestamp(context, control, workspace, active, timestamps)` 在现有轮询报告之外更新调用者提供的本卡 `uint8` 持久缓冲。每条 lane 64 B，按下表解码。缓冲绑定一次 owner 生命周期，由调用方在首次使用前调零。调用方以同一 stream 或显式依赖串行读写，保证后续消费者看见已提交的记录。每条 lane 保存最近一次有效观测，用于在对应轮有效期间匹配。需要历史记录时由消费方留存快照。
+
+| 偏移 | 类型 | 字段 |
+|---:|---|---|
+| 0、4 | `uint32` | 有效标志、当前观测的 `input_bit` |
+| 8、16 | `uint64` | 上一次被 Scheduler 接管的 tick、本次首见设备系统周期 |
+| 24–51 | 7 个 `uint32` | `microbatch_idx, layer_idx, round_idx, num_comm_rounds, num_round_tokens, return_bit, num_recv_records` |
+| 52 | `uint32` | Inbox 的分轮模式 |
+| 56–63 | 2 个 `uint32` | 保留 |
+
+去重比较同一 lane 中的 `(上一代接管 tick, 当前输入位)`。该 tick 在当前发布被接管前保持固定，包括旧轮提前退役到 Scheduler 清理 Pending 的间隔。即使 Ready 位在跳过两次 Poll 后重新相同，不同的接管 tick 仍能区分两次发布。读取时间时应检查对应的轮次身份和有效标志，避免把旧记录算给当前轮。旧接口继续返回四列轮询报告。
+
+**按逻辑轮聚合。** 对同一 DP、phase、microbatch、层、轮的参与成员，最小观测周期表示最早成员开始可见，最大观测周期表示所有成员都曾被看到。缺任一成员观测时，无法计算齐备时间。零路由成员也有 Ready。等齐后的 Credit 约束由现有协议处理。这一节只交付 Poll 周期，组批策略由上层设计。
+
+Scheduler 独立扫描 Ready。若发布发生在该 lane 的 Poll 扫描之后、Scheduler 扫描之前，Scheduler 可以先接管它，该发布没有首见周期。消费方需要处理时间戳缺失。
+
+### 11.2 各 Attention 成员独立分轮
+
+每个 A 以自己的发送行数 `B_i`、窗口容量 `C_i` 得出 `J_i=max(1,ceil(B_i/C_i))`。A 的 DS 和 CR 使用同一个本地总轮数。通过 Inbox 把 `J_i` 告诉各 F，`round_idx+1==J_i` 表示这个成员的最后一轮。原协议用 DP 共同总轮数，短成员继续发空轮。两种语义用模式值区分，`0` 表示 DP 共同轮数，`1` 表示各成员各自的轮数。独立分轮时，owner 在准备通信资源前由所有 rank 调用 `enable_local_rounds()`，设置 Context 原保留字（偏移 68）。TaskInfo 和 Inbox 的第八个 `uint32`（偏移 28）携带同一模式值。它们的尺寸沿用本版格式。使用同一模式的 CAM、DeepEP 构建及 runner 需要一起部署。固定 AOT 调试控制路径仍使用共同轮数。
+
+| 阶段 | 成员独立分轮 |
+|---|---|
+| 首轮 | F 等齐本 DP、phase 登记的每个逻辑成员。即使某 A 的整个 microbatch 是 0 行，也发一个 0 行的第 0 轮并声明本轮为本地最后一轮。 |
+| 首轮到齐 | F 保存本次任务的成员本地轮数及进度。组内用 DP、phase、microbatch、层、轮识别同一轮，成员总轮数可各自不同。 |
+| 后续轮 | 第 `r` 轮只等 `r<J_i` 的成员，校验该成员的轮号和轮数声明。没有路由的数据成员仍发布 Ready。此前已发完的成员退出该轮的等待集合。 |
+| 分片和完成 | Scheduler 冻结本轮实际参与的 Member。DR 按冻结成员核对各自 Inbox，按整专家组取片。CS 最后一个计算片完成且回包排空后，才为本轮参与的成员写 Done 再写 Consumed，并推进已完成的轮号。 |
+| A 收尾 | 每张 A 的 CR 按自己的轮数收齐所有 F 的 Done，归并本地实际输出，回写 Credit。空轮也走确认。最后一轮完成后，该 A 可按现有槽位复用约束发布下一 microbatch。 |
+
+F 的跨轮记录放在本地 scheduler workspace 后缀，每 F 预分配至多 `L` 个记录位置，每位置占 `32+A32(4L)` 字节。32 B 头保存逻辑任务键和进度，后面用 `uint32[L]` 保存首轮冻结的成员所在 lane 对应的本地总轮数。物理 lane 可以接下一批，旧记录的作用域仍由逻辑任务键决定。一个成员在同一 microbatch 的各轮沿用首轮记录的物理 lane，便于把后续到达和首轮声明关联。F 在 Scheduler 接管 CS 已提交的终态后推进跨轮记录，完成尾轮时回收记录位置。跨轮任务数量受此缓冲区容量约束。
+
+F 的跨轮记录独立于当前计算事务和物理槽。短成员已经退出旧 microbatch 时，长成员可能仍有后续轮。短成员的槽可以发布新 microbatch 的首轮，F 同时保存旧任务的尾轮进度。身份至少绑定 DP、phase、microbatch 和层。本版要求框架在旧任务所有成员的尾轮退役前保持该键唯一。单个 Ready 位只负责槽位发布，无法承担任务身份。
+
+回包地址仍按 Member 的 lane、轮内 token 和 TopK 槽计算。F 只针对冻结进本轮的 Member 写数据和确认。A 对自身发布的轮仍需要等全部 F，包括没有接到这张 A 路由的 F。整个 DP 完成需要涵盖所有成员的本地末轮。最短成员自己的 CR 完成仅表示该成员已经完成。
+
+### 11.3 分轮取舍与验证
+
+等长 TP/SP 发送可由共同的补齐行数直接推导轮数。共用轮数模式下，短 A 需要按剩余轮逐次走空控制握手。独立分轮在发送前省去轮数交换，也省去已结束 A 的空尾轮握手。F 为此保存跨轮状态。缓冲仍按现有整专家组的保守容量上界分配。
+
+以下用例的构建、运行和归档统一使用 `H=7168`、BF16。每次保存源提交、runner、构建产物、实机加载路径和散列、卡映射、参数、退出码和断言对应的原始日志。旧 `H=128` 数据按历史证据保留。
+
+| 目标 | 输入和检查 |
+|---|---|
+| 基线等长与时间戳 | 同一个 DP 的两个 A 依次发布。记录同一 lane 连续多次 Poll 的首见周期和有效性，新一代 Ready 获得新值。同卡第二次设备读取与较早的首见周期比较。核零路由成员和未观测轮。 |
+| 跨窗口边界 | 首跑用 `B=(8193,8192)`、`C=8192`、`Q=Q_alloc=16384`，同 DP、phase、MB、层和每源一个物理槽。共同轮数用同一 fixture 验证短卡有空尾轮。独立轮数检查首轮等齐，两 F 都观察到第二轮仅长卡参与，短卡收齐自己的首轮确认，逐元素回包匹配。资源允许时沿用 `B=(32769,32768)`、`C=32768`、`Q=Q_alloc=65536`。 |
+| 零行成员与提前复用 | `B=0` 的成员完成首轮零行握手。`--reuse-short-slot --microbatches 2` 用例在短成员 CR 完成后，用原槽、不同 MB ID 及可辨识输入发布新一批，同时保留长成员旧尾轮。等待集合和 Done／Consumed／Credit 日志按 MB、lane、位、轮号关联。 |
+| 错误和回退 | 混用共同轮数和独立轮数的报文、同成员重报不同轮数、跳轮及任务标识重用按发布模式核对失败结果。核对正常共同轮数路径与旧 Poll 入口。非法输入注入和局部仿真分别记录。 |
+
+先验证正确性，再记录所需的设备时间戳和耗时。身份和达成条件均绑定到同一次运行。轮换同一物理槽时至少覆盖三代，确认交替位回到原值仍取得新时间。再覆盖 Poll 跳过旧发布或 Scheduler 先接管的场景，用有效标记和身份核对时间归属。
+
+在 2A2F 且同 phase 两条 lane 的 32K 用例中，保守单专家组上界为 65,536 行。验证前核对实际后端是否允许 `Q_alloc=65536`、所选输入输出缓冲和每卡显存预算。两份 BF16 `[65536,7168]` 计算张量合计约 1.75 GiB；另需计入注册窗口、workspace、输入权重和通信运行时。CPU 回归、构建和跨卡各用例按实际完成情况归档。
+
+[分轮方案对比与验收 trace](../../ANALYSIS/AFD_FFN_POLL_TIMING_LOCAL_ROUNDS.md) 给出两种模式的相同时序、时钟解释和结果判据。
