@@ -1,8 +1,8 @@
 # A5 AFD FFN 计算事务与通信内存设计
 
-本文按一轮数据从 Attention 到 FFN、计算后回到 Attention 的顺序展开。可以先用第 1 节讲清分工，再用第 3、4 节画出通信窗口，用第 6、7 节讲清为什么一次选批能安全地执行多片，最后用第 8 节把具体行号串起来。
+本文按 Attention 发数据、FFN 选批和计算、Attention 收回结果的顺序描述通信窗口和算子交接。第 3、4 节给出通信内存布局，第 6、7 节解释 Active 和计算事务，第 8 节通过 CPU 例子推导地址。v1 源码索引、实际四卡全景和一条 token 的寻址见[纯 UMDK 2A2F 联调指南](a5_afd_ffn_transaction_2a2f_guide.md)。
 
-实现基点是 UMDK `cam_feature@9179865e`，已合入 #3860 和 #3861。本文描述的是 CAM `b795d1df` 和 DeepEP owner/scheduler `8757a68d` 配套的 **BF16 事务模式**。默认模式仍由 scheduler 逐片生成 Active，参见[五算子设计](a5_async_afd_deepep_operator_design.md)。文末另列 DeepEP FP8 布局的预算例和设备待验项。[第 11 节](#11-poll-设备时间戳与-attention-成员独立分轮) 说明后续 BF16 事务接口增量、与基线的区别及实机验收。 [CAM 事务提交](https://gitcode.com/puxiaokun3721/umdk/commit/b795d1dfc2b7e6da64c48af02d7f00fecbfacaa7) · [DeepEP 支持提交](https://github.com/puxiaokun3721/DeepEP-Ascend/commit/8757a68d5f258c302ab5146df62119b70ea80b6d)
+第 1–9 节的布局和地址公式源于 CAM `b795d1df` 与 DeepEP owner/scheduler `8757a68d` 的 BF16 事务模式。旧模式逐片生成 Active，见[五算子设计](a5_async_afd_deepep_operator_design.md)。第 10、11 节补充个人 UMDK 分支 `5c3daaa7` 的纯 CAM 四卡实测、Poll 的设备时间和 Attention 成员独立分轮。FP8 仅作为布局预算。 [CAM 事务基点](https://gitcode.com/puxiaokun3721/umdk/commit/b795d1dfc2b7e6da64c48af02d7f00fecbfacaa7) · [DeepEP 布局基点](https://github.com/puxiaokun3721/DeepEP-Ascend/commit/8757a68d5f258c302ab5146df62119b70ea80b6d) · [个人 UMDK 实测提交](https://gitcode.com/puxiaokun3721/umdk/commit/5c3daaa7ccffe4699ceed63b88cba104eb5af4c7)
 
 ## 1. 全链路和三个事务边界
 
@@ -11,14 +11,19 @@ Attention 侧 A                                    FFN 侧 F
  x / TopK / weights / mask
           │
           ├── DS 写 records、refs、counts、prefix ───► F Payload
-          ├── DS 写 Inbox，最后发 InputReady ─────────► F Control
-          └── DS 提交 A 本地 Ledger                        │
+          ├── DS 写 Inbox ──────────────────────────► F Control
+          ├── DS 提交 A 本地 Ledger                        │
+          └── DS 最后发 InputReady ──────────────────► F Control
                                                            ▼
-                                             Poll 观察 → Scheduler 一次选批
+                                         Poll 观察 NEW_READY
+                                           ├── 带时间戳入口写 F 本地 timestamps
+                                           └── 轮询报告供调用方读取
+                                                           │
+                                                Scheduler 一次选批
                                                            │
                                                固定的本地计算事务
                                                            │
-                                               DR → FFN → CS，循环多片
+                                          DR → FFN → ComputeReady → CS，循环多片
                                                            │
  A Payload ◄────────────────────────────── CS 按 lane/token/topk 写 BF16 route 结果
  A Control ◄────────────────────────────── CS 在单轮完成时写 Done → Consumed
@@ -71,7 +76,7 @@ Context ABI 为 **2**。Context 固定头 **256 B**，后面是静态目录。�
 | 16 | `uint32 × 4` | 全局 expert 数、TopK、hidden 的传输字节数、scale pack 数。 |
 | 32 | `uint32 × 4` | 向量核数、本地完整 MB 的输入分配上限、最大 lane 容量 `C_max`、DS 每 tile 的 token 数。 |
 | 48 | `uint32 × 4` | 层数、当前 A 在 A 列表中的下标、本地槽数、返回进度模式。 |
-| 64 | `uint32 × 2` | channel stride、保留字。 |
+| 64 | `uint32 × 2` | channel stride、分轮模式。基线在偏移 68 保留，独立分轮接口在此写 `comm_round_mode`。 |
 | 72 | `uint64 × 4` | lane、F peer、地址、层目录相对 Context 的偏移。 |
 | 104 | `uint64 × 4` | Context、Payload、Control 的字节数，返回目录相对 Context 的偏移。 |
 | 160 | `uint64 × 12` | 10 个 DS 工作区区段偏移，随后是工作区总字节和保留字。 |
@@ -120,7 +125,7 @@ F Payload
 
 | 相对 lane 起点 | 大小 | 字段、读写和含义 |
 |---|---:|---|
-| `+0` | 64 B | **Inbox**。依次为 `microbatch_idx`（0）、`layer_idx`（4）、`round_idx`（8）、`num_comm_rounds`（12）、`num_round_tokens`（16）、`return_bit`（20）、`num_recv_records`（24），其余 36 B 保留。DS 写，scheduler 快照，DR 校验。`num_round_tokens` 是含 mask 行的轮内输入长度，`num_recv_records` 是本 F 去重后条数。 |
+| `+0` | 64 B | **Inbox**。依次为 `microbatch_idx`（0）、`layer_idx`（4）、`round_idx`（8）、`num_comm_rounds`（12）、`num_round_tokens`（16）、`return_bit`（20）、`num_recv_records`（24）。较新的事务接口在 28 B 偏移增加分轮模式，剩余 32 B 保留。DS 写，Scheduler 快照，DR 校验。`num_round_tokens` 是含 mask 行的轮内输入长度，`num_recv_records` 是本 F 去重后条数。 |
 | `+64` | 32 B | **InputReady**。DS 写输入代次位，Poll、scheduler 和 DR 读。 |
 | `+96` | 32 B | **Credit**。A 的 CR 写允许 F 使用返回窗口的代次，F 的 scheduler/CS 读。 |
 
@@ -160,7 +165,7 @@ A 侧窗口预留为 `Σ_本卡lane A512(C_l*K*D_ret)`，owner 最少申请 512 
 
 | 本地结构 | 大小及位置 | 字段及作用 |
 |---|---|---|
-| `AFDTaskInfo` | 每任务 64 B | 前七个 `uint32` 为 `abi_version, src_rank_idx, payload_slot_idx, microbatch_idx, layer_idx, num_tokens, num_comm_rounds`，其余 36 B 保留。`num_tokens` 是该成员完整 MB 的逻辑行数。 |
+| `AFDTaskInfo` | 每任务 64 B | 前七个 `uint32` 为 `abi_version, src_rank_idx, payload_slot_idx, microbatch_idx, layer_idx, num_tokens, num_comm_rounds`。较新的事务接口在 28 B 偏移增加分轮模式，剩余 32 B 保留。`num_tokens` 是该成员完整 MB 的逻辑行数。 |
 | `AFDRoundLedger` | 每槽两项，每项 64 B。第 `r` 轮用 `2*slot+r%2` | 前八个 `uint32` 依次为 `state, input_bit, return_bit, round_idx, token_begin, num_round_tokens, final_round, microbatch_idx`，余 32 B 保留。DS 先写字段再提交 `state=1`。CR 在全部 Credit 写完后清回空闲 `state=0`。 |
 | `AFDSendState` | 每槽 32 B，在 A 的 DS workspace | `next_input_bit, next_return_bit, has_published, last_input_bit` 各 4 B，余 16 B 保留。DS 独占推进。 |
 | `AFDReturnProgress` | round-step 模式每槽 96 B | 前 64 B 冻结 `TaskInfo`，随后是 `state, next_round, last_input_bit, error_code` 各 4 B，余 16 B 保留。状态为 `IDLE/RUNNING/WAIT_ACK/DONE/ERROR`。每任务启动一次，后续 sweep 继续游标。 |
@@ -185,6 +190,8 @@ CR 校验 Ledger 中的轮、MB、行数和代次，等待**所有 F** 的 Done�
 
 F 的 `ffnPoll()` 输出 `int32[L,4]`，共 `16L` 字节。四列是 `[分类, 实际 Ready 位, 期待位, phase]`，分类 `0` 无新 Ready，`1` 新 Ready，`2` 已在 Pending，`-1` 错误。Poll 只观察。旧通信轮已被 CS 退役时，Poll 用旧 Member 快照的 `input_bit^1` 观察新 Ready，scheduler 到下一次选批再接管。
 
+个人 UMDK 分支的 `cam_afd_ffn_poll` 返回同样的状态报告。调用 `cam_afd_ffn_poll_timestamp` 时，首次观测还会写入调用方持有的 F 本地设备缓冲 `timestamps`。该缓冲每 lane 占 64 B，可由后续消费者按 lane 和轮次身份取周期值。Scheduler 使用下表的 workspace 独立扫描和接管。`Pending.first_seen` 是接管时的逻辑 tick，用于现有的排序，设备周期见第 11.1 节。
+
 | Scheduler workspace 区域 | 起始偏移 | 大小与字段 |
 |---|---:|---|
 | `AFDSchedulerState` | 0 | 32 B。`tick` 为 8 B，随后是 4 B `last_phase`、4 B `has_phase` 和 16 B 保留字。 |
@@ -195,6 +202,8 @@ F 的 `ffnPoll()` 输出 `int32[L,4]`，共 `16L` 字节。四列是 `[分类, �
 Scheduler 只接管期待位匹配的 lane，快照 Inbox 和 counts，并校验轮号、层白名单、计数和容量。到齐键是 `(dp, phase, microbatch, layer, round, total_rounds)`，按该 DP/phase 的逻辑成员集合判断。选择首组时优先考虑和上次不同的就绪 phase，再按首次就绪顺序。随后冻结同 phase 的就绪整轮集合，可来自不同层、DP、MB 和轮号。选中后的 `txn_id` 是本 F 本地编号。 [Scheduler workspace ABI](https://github.com/puxiaokun3721/DeepEP-Ascend/blob/8757a68d5f258c302ab5146df62119b70ea80b6d/deep_ep/include/deep_ep/layout/afd/scheduler.hpp#L6-L24) · [Scheduler 实现](https://github.com/puxiaokun3721/DeepEP-Ascend/blob/8757a68d5f258c302ab5146df62119b70ea80b6d/deep_ep/include/deep_ep/impls/afd/ffn_scheduler.hpp#L211)
 
 `phase` 的 0/1 与 P/D 的对应关系由框架配置。默认的 `COMPUTE_AHEAD` 允许有 route 的轮在 Credit 未到时先入选，CS 首次写回该轮前再取许可。`PRECHECK` 在选批时先核对所有成员的 Credit。全轮零 route 时，两种模式都在入选前核对 Credit，避免空轮占住唯一 Active 等待。
+
+个人 UMDK `5c3daaa7` 的固定 AOT Scheduler 用 `kCreditPrecheck=false`，Torch 入口没有切换参数。配套 DeepEP owner 在准备时通过 `prepare_ffn(precheck=True)` 选择预检查的 JIT 模板，默认为 `False`。Credit 约束的是返回窗口代次。算子是否拆 stream 由调用方另行决定。 [两种策略和配置入口](a5_afd_ffn_transaction_2a2f_guide.md#24-qq_alloc-和-credit-策略)
 
 ## 6. Active 是什么，当前片和固定事务各放哪里
 
@@ -248,6 +257,8 @@ active
 | 旧 per-expert counts 与 psum | `8R` | 两个 `int32[R]` 张量仍分配。事务模式的 scheduler 写零，计算端从本片区间和 `group_counts` 推导跨层分组边界。 |
 
 `ExecutionState.stage` 为 `EMPTY=0, SELECTED=1, INPUT_READY=2, COMPUTE_READY=3, COMMITTED=4, ABORTED=5`。Grant 为 `NONE=0, HELD=1, FINISHED=2`。`Completion.state` 为 `EMPTY=0, ARMED=1, READY=2`。这三套本地状态与通信窗口的交替位各有用途。 [F 本地分配](https://github.com/puxiaokun3721/DeepEP-Ascend/blob/8757a68d5f258c302ab5146df62119b70ea80b6d/csrc/buffers/afd.hpp#L503-L570) · [Completion 布局](https://github.com/puxiaokun3721/DeepEP-Ascend/blob/8757a68d5f258c302ab5146df62119b70ea80b6d/deep_ep/include/deep_ep/layout/afd/return.hpp#L25-L34)
+
+FFN 计算写 `combine_x`，调用方在计算之后排入 `ComputeReady`，只对 `WORK` 片标记 `COMPUTE_READY`。同一条 stream 保证数据顺序，跨流用 event/wait 建立依赖。当前 CS 的 `WORK` 路径还显式检查本地状态，缺标记时报 `STATE_ORDER`，整片为 `CONTROL` 时使用 `INPUT_READY`。 [状态与 stream 顺序](a5_afd_ffn_transaction_2a2f_guide.md#25-computeready-和-stream-顺序各保证什么)
 
 ## 7. 从一次选批到多片提交
 
@@ -303,6 +314,8 @@ DP0 的 lane 0 先到，Poll 能看到新 Ready，scheduler 还在等 lane 1。�
 片 0 结束后，lane 0、1 即使已经发布新 Ready，也不会加入这份固定事务。对 lane 2 的片 1 不读取它们的旧 Inbox 或 Payload。两个层的 e0 虽然编号相同，分别位于不同的计算组，使用不同权重。 当前 owner 只为一套传输 shape 和格式建立目录，入选层共用 `H/K/R`、dtype、scale 布局与行对齐，具体权重通过 `(layer_slot, local_expert)` 选择。框架还需要确认后端允许这些层的 FFN 形状和权重格式合批。 [CPU 模拟输入](https://github.com/puxiaokun3721/DeepEP-Ascend/blob/8757a68d5f258c302ab5146df62119b70ea80b6d/tests/afd/ffn_transaction_sim.py#L199) · [完整 JSONL trace](https://github.com/puxiaokun3721/DeepEP-Ascend/blob/8757a68d5f258c302ab5146df62119b70ea80b6d/tests/afd/ffn_transaction_trace.jsonl)
 
 ## 9. 容量规则和 4A4F 字节预算
+
+4A4F 预算按下文的通用公式计算。已跑通的纯 UMDK 2A2F 则按 `C=4096` 预留通信窗口、按 `Q_alloc=8192` 预留 F 本地计算缓冲。图中分开画出了远端可写窗口和每卡本地工作区。 [四卡内存分配图](a5_afd_ffn_transaction_2a2f_guide.md#通信内存预留和本地计算内存)
 
 ### 9.1 跨层为什么要按组重新对齐
 
@@ -380,26 +393,38 @@ BF16 同一 lane 的四段起点分别是 `0 / 486,539,264 / 487,325,696 / 487,3
 
 ## 10. 调用、插桩与验收
 
+### 10.1 纯 UMDK 四卡实测
+
+2026 年 11 月 15 日 19:20（北京时间）回执对应个人 UMDK `codex/cam-ffn-transaction@5c3daaa7ccffe4699ceed63b88cba104eb5af4c7`。实测在同节点 4 张 A5 卡运行，由 UMDK 测试代码借助 CANN HCCL/HCOMM 建通信窗口和 Jetty。Python 加载 `umdk_cam_op_lib`，运行环境中 DeepEP 包和扩展均未安装。使用 BF16、`H=7168`、`C=BS=4096`、`Q=Q_alloc=8192`、`K=2`、`E=4`、`net-layer=0`，两张 A 分属不同 DP 与不同层，每张 A 发一轮。
+
+两张 F 用带时间戳的 Poll 观察并各选一次批。F0 同一事务的两片有 8192 和 4096 行，F1 处理 4096 行并完成另一条零路由通信轮。用例中的 FFN 为按层和按专家设置不同增益的 BF16 计算，然后调用 `ComputeReady`。两张 A 各校验 29,360,128 个不等权回包元素，F0 第二片等到 A0 收完结果才启动。A 侧账本释放，两张 F 的终态 Credit 均为 `[1,1]`。CANN 编译和四卡运行都退出 0，运行输出 `CAM_AFD_2A2F_PASS`。
+
+构建、安装、启动及日志的核对方法见[纯 UMDK 2A2F 联调说明](a5_afd_ffn_transaction_2a2f_guide.md)。[UMDK 运行说明](https://gitcode.com/puxiaokun3721/umdk/blob/5c3daaa7ccffe4699ceed63b88cba104eb5af4c7/test/cam/README.md) · [四卡脚本](https://gitcode.com/puxiaokun3721/umdk/blob/5c3daaa7ccffe4699ceed63b88cba104eb5af4c7/test/cam/afd_ffn_transaction_2a2f.py)
+
+### 10.2 四通信算子 PR 与配套诊断
+
+DS、DR、CS、CR 的上游 PR 目标为 `cam_feature`。四算子候选 `dfc75a2f` 用配套 DeepEP owner 在 A5、BF16、`H=7168` 上验证了跨层多片、同一 DP 长短成员独立分轮、短成员同槽复用及旧调用 eager 兼容。PR 后续整理为 `e15b13ed`，该提交有 CPU 差分和社区门禁结果，A5 实测回执对应 `dfc75a2f`。Poll、Scheduler、ComputeReady 和独立 2A2F 入口在个人 UMDK 分支交付。 [UMDK CAM PR !3918](https://gitcode.com/openeuler/umdk/merge_requests/3918)
+
 在配套 DeepEP-Ascend 工作树中运行下列命令，可重建第 8 节的 CPU 事件 trace。
 
 ```powershell
 python -B tests/afd/ffn_transaction_sim.py --trace "$env:TEMP/afd-ffn-transaction.jsonl"
 ```
 
-- **初始化。** 先创建使用同一 lane/layer 目录的 owner。F 调用 `prepare_recv(q,q_alloc,a,ffn_transaction=True,backend_max_rows=...)` 和 `prepare_ffn(...)`。A 准备 CR；本 A 注册了多个槽且任务有多轮时，采用现有的 round-step 和公平 sweep，即使当前只有一个槽在途。DS 与 CR 用原有独立的工作区和执行依赖。
+- **初始化。** 先创建使用同一 lane/layer 目录的 owner。F 调用 `prepare_recv(q,q_alloc,a,ffn_transaction=True,backend_max_rows=...)` 和 `prepare_ffn(...)`。A 准备 CR。本 A 注册了多个槽且任务有多轮时，采用现有的 round-step 和公平 sweep，即使当前只有一个槽在途。DS 与 CR 用原有独立的工作区和执行依赖。
 - **调度。** F 用 `ffnPoll()` 观察，到齐由 `ffnScheduler()` 接管。收到 `Selected` 后开始循环 DR → FFN → `computeReady()` → CS，直到事务 `Complete`。A5 诊断 runner 由 Host 同步读取状态并输出 `FFN_TX` 事件，字段包含 F rank、事务号、phase、通信轮键、片号、计算组和逐轮确认。生产接入应使用后端所需的设备侧布局和依赖。
 - **验收。** 同一 F 的同一 `txn_id` 只有一次有效选批，包含固定通信轮集合。各 `(layer,expert)` 只在一个片出现。每轮在本 F 完成一次并独立确认，跨层回包逐 MB 与对应层独立 golden 一致。覆盖空轮、成员迟到、P/D 同时到齐、不同 F 选批不同、容量不足和已退役槽复用。
 - **证据边界。** 配套提交提供 CPU 模拟、原有 CPU 回归和 C++ 辅助逻辑验证。CANN/Bisheng 构建与加载、A5 可见性与回包顺序、目标 GMM 形状、图模式和性能须分别以对应实机证据验收。 [构建与八卡诊断命令](https://github.com/puxiaokun3721/DeepEP-Ascend/blob/8757a68d5f258c302ab5146df62119b70ea80b6d/tests/afd/README-ffn-transaction.md) · [诊断 runner](https://github.com/puxiaokun3721/DeepEP-Ascend/blob/8757a68d5f258c302ab5146df62119b70ea80b6d/tests/afd/ffn_transaction_runner.py)
 
 ## 11. Poll 设备时间戳与 Attention 成员独立分轮
 
-两项增量都沿用 BF16 计算事务，可独立启用。Poll 把首次看到 Ready 的时间交给调用方。成员独立分轮由 A 侧为每个成员申报本地轮数，F 根据首轮申报确定后续各轮的等待集合。两项可以分别验证。以下为待 A5 验收的候选接口和测试口径，后续实机统一使用 `H=7168`。
+两项增量都沿用 BF16 计算事务，可独立启用。纯 UMDK 的四卡运行确认了每张 F 能记录两个 lane 非零的设备周期，反复轮询同一轮时周期不变。A 侧独立分轮在四算子候选与配套 DeepEP owner 的四卡运行中验证，见第 10 节。
 
 ### 11.1 Poll 记录哪一个时间
 
 Poll 在本 F 的设备上读取通信窗口的 Ready。第一次看到匹配当前期待位的 `NEW_READY` 时，在该 Ready 已经读回以后调用 `asc_get_system_cycle()`，保存原始 `uint64_t` 周期数。此时刻受 Poll 调用间隔影响。输入可以在两次 Poll 之间到达，记录的是 Poll 观测时刻。Attention 发布、Scheduler 接管和首次选中分别是其他事件。 [Ascend 950 系统计数器](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/API/ascendcopapi/docs/en/api/SIMD-API/C-API/sys_var/asc_get_system_cycle.md)
 
-- **单位**。调度消费接口以原始周期为单位。按项目 Ascend 950 S 侧的口径，周期差除以 1000 得微秒。读取方应使用同一 F 上经验证的同源计数器。实机验收用独立的第二次设备读取确认可比较性。
+- **单位**。接口保存原始周期。消费方可用同一 F 上经验证的同源计数器读取 `now_cycle`，再算 `now_cycle - system_cycle`。项目的 Ascend 950 S 侧展示口径为周期差除以 1000 得微秒。四卡用例核的是首见周期有效、身份匹配和重复 Poll 保值，跨卡时钟比较与等待时间策略需各自验证。
 - **标记**。时间与该 lane 的本次发布代次绑定，单独保存有效标志。同一次到达反复被 Poll 看见时沿用第一次周期。Ready 位在槽复用时重复出现，去重要同时区分发布代次。若使用当前 Pending 保存的上一轮接管 tick，它只用于区分同 lane 的发布，和已有 Scheduler 的排序意义相互独立。
 - **提前退役**。某轮在 FFN 计算事务尚有后续片时已经完成，Poll 可按已退役 Member 的输入位翻转识别下一代。即使 Scheduler 尚未清理旧 Pending，也能记录新一轮。旧 Pending、Ready 不匹配和从未被 Poll 观测到的轮不会获得新的时间记录。
 
@@ -413,7 +438,7 @@ Poll 在本 F 的设备上读取通信窗口的 Ready。第一次看到匹配当
 | 52 | `uint32` | Inbox 的分轮模式 |
 | 56–63 | 2 个 `uint32` | 保留 |
 
-去重比较同一 lane 中的 `(上一代接管 tick, 当前输入位)`。该 tick 在当前发布被接管前保持固定，包括旧轮提前退役到 Scheduler 清理 Pending 的间隔。即使 Ready 位在跳过两次 Poll 后重新相同，不同的接管 tick 仍能区分两次发布。读取时间时应检查对应的轮次身份和有效标志，避免把旧记录算给当前轮。旧接口继续返回四列轮询报告。
+去重比较同一 lane 中的 `(上一代接管 tick, 当前输入位)`。该 tick 在当前发布被接管前保持固定，包括旧轮提前退役到 Scheduler 清理 Pending 的间隔。即使 Ready 位在跳过两次 Poll 后重新相同，不同的接管 tick 仍能区分两次发布。读取时间时应检查对应的轮次身份和有效标志，避免把旧记录算给当前轮。普通 `cam_afd_ffn_poll` 返回四列报告，带时间戳的入口另更新 `timestamps`。当前 Scheduler 接口没有传入这个缓冲，组批仍使用原有的 `Pending.first_seen` 逻辑 tick。[CAM 时间戳布局](https://gitcode.com/puxiaokun3721/umdk/blob/5c3daaa7ccffe4699ceed63b88cba104eb5af4c7/src/cam/comm_operator/ascend_kernels/utils/op_kernel/deep_ep/layout/afd/poll_timestamp.h) · [首见采样实现](https://gitcode.com/puxiaokun3721/umdk/blob/5c3daaa7ccffe4699ceed63b88cba104eb5af4c7/src/cam/comm_operator/ascend_kernels/utils/op_kernel/deep_ep/impls/afd/poll_timestamp.h)
 
 **按逻辑轮聚合。** 对同一 DP、phase、microbatch、层、轮的参与成员，最小观测周期表示最早成员开始可见，最大观测周期表示所有成员都曾被看到。缺任一成员观测时，无法计算齐备时间。零路由成员也有 Ready。等齐后的 Credit 约束由现有协议处理。这一节只交付 Poll 周期，组批策略由上层设计。
 
@@ -421,7 +446,11 @@ Scheduler 独立扫描 Ready。若发布发生在该 lane 的 Poll 扫描之后�
 
 ### 11.2 各 Attention 成员独立分轮
 
-每个 A 以自己的发送行数 `B_i`、窗口容量 `C_i` 得出 `J_i=max(1,ceil(B_i/C_i))`。A 的 DS 和 CR 使用同一个本地总轮数。通过 Inbox 把 `J_i` 告诉各 F，`round_idx+1==J_i` 表示这个成员的最后一轮。原协议用 DP 共同总轮数，短成员继续发空轮。两种语义用模式值区分，`0` 表示 DP 共同轮数，`1` 表示各成员各自的轮数。独立分轮时，owner 在准备通信资源前由所有 rank 调用 `enable_local_rounds()`，设置 Context 原保留字（偏移 68）。TaskInfo 和 Inbox 的第八个 `uint32`（偏移 28）携带同一模式值。它们的尺寸沿用本版格式。使用同一模式的 CAM、DeepEP 构建及 runner 需要一起部署。固定 AOT 调试控制路径仍使用共同轮数。
+每个 A 以自己的发送行数 `B_i`、窗口容量 `C_i` 得出 `J_i=max(1,ceil(B_i/C_i))`。A 的 DS 和 CR 使用同一个本地总轮数。通过 Inbox 把 `J_i` 告诉各 F，`round_idx+1==J_i` 表示这个成员的最后一轮。共同轮数模式下，短成员继续发空轮。`0` 表示 DP 共同轮数，`1` 表示成员独立轮数。配套 DeepEP owner 在准备通信资源前由所有 rank 调用 `enable_local_rounds()`，设置 Context 的 `comm_round_mode`（偏移 68）。TaskInfo 和 Inbox 的第八个 `uint32`（偏移 28）携带同一模式值，结构尺寸保持一致。发送、调度、回包均须使用同一模式。
+
+个人 UMDK `5c3daaa7` 的固定 2A2F CAM 控制入口支持按 Context 模式和 Scheduler 工作区尺寸选择两种布局。该拓扑共同轮数使用 288 B，独立轮数使用 416 B。纯 UMDK 四卡用例配置为共同轮数且每 A 发一轮。独立分轮及短成员同槽复用的 A5 回执来自第 10.2 节的配套测试。
+
+共同轮数 `W` 由上层提前填入同一 DP 各 A 的 TaskInfo。DS 使用本卡行数和槽容量校验 `W` 能否覆盖本卡输入，F 等齐时校验成员申报的共同轮数。上层从已知的 DP 切分计划得到 `W`，或同步各成员最低所需轮数的最大值。配套诊断器从各进程共用的 CLI 参数得到长度与窗口，联调路径没有为轮数新增集合通信。 [模式配置与轮数来源](a5_afd_ffn_transaction_2a2f_guide.md#23-分轮模式怎样配置谁算总轮数)
 
 | 阶段 | 成员独立分轮 |
 |---|---|
@@ -441,7 +470,7 @@ F 的跨轮记录独立于当前计算事务和物理槽。短成员已经退出
 
 等长 TP/SP 发送可由共同的补齐行数直接推导轮数。共用轮数模式下，短 A 需要按剩余轮逐次走空控制握手。独立分轮在发送前省去轮数交换，也省去已结束 A 的空尾轮握手。F 为此保存跨轮状态。缓冲仍按现有整专家组的保守容量上界分配。
 
-以下用例的构建、运行和归档统一使用 `H=7168`、BF16。每次保存源提交、runner、构建产物、实机加载路径和散列、卡映射、参数、退出码和断言对应的原始日志。旧 `H=128` 数据按历史证据保留。
+下表是复用或补覆盖时的测试设计，已通过的范围见第 10 节。构建、运行和归档使用 `H=7168`、BF16。每次保存源提交、runner、构建产物、实机加载路径和散列、卡映射、参数、退出码和断言对应的原始日志。旧 `H=128` 数据按历史证据保留。
 
 | 目标 | 输入和检查 |
 |---|---|
